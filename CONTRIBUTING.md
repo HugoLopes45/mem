@@ -3,7 +3,7 @@
 ## Development setup
 
 ```bash
-git clone https://github.com/YOUR_ORG/mem
+git clone https://github.com/HugoLopes45/mem
 cd mem
 cargo build
 cargo test

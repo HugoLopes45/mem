@@ -1,6 +1,6 @@
 # mem — persistent memory for Claude Code
 
-[![CI](https://github.com/YOUR_ORG/mem/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_ORG/mem/actions/workflows/ci.yml)
+[![CI](https://github.com/HugoLopes45/mem/actions/workflows/ci.yml/badge.svg)](https://github.com/HugoLopes45/mem/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/mem.svg)](https://crates.io/crates/mem)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -28,7 +28,7 @@ Claude Code agents forget everything when a session ends. Manual memory tools ha
 ## Install
 
 ```bash
-cargo install --git https://github.com/YOUR_ORG/mem
+cargo install --git https://github.com/HugoLopes45/mem
 ```
 
 No system dependencies. SQLite is statically linked — `cargo install` is all you need.
@@ -37,7 +37,7 @@ No system dependencies. SQLite is statically linked — `cargo install` is all y
 <summary>Build from source</summary>
 
 ```bash
-git clone https://github.com/YOUR_ORG/mem
+git clone https://github.com/HugoLopes45/mem
 cd mem
 cargo build --release
 # binary at: ./target/release/mem
@@ -51,7 +51,7 @@ Requires Rust 1.75+.
 **1. Install `mem`**
 
 ```bash
-cargo install --git https://github.com/YOUR_ORG/mem
+cargo install --git https://github.com/HugoLopes45/mem
 ```
 
 **2. Copy hook scripts to a stable location**
