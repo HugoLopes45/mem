@@ -25,3 +25,9 @@
 # Environment
 .env
 .env.local
+
+# Forge dev tooling (internal only)
+.forge/
+
+# Claude Code agent memory (internal only)
+.claude/
