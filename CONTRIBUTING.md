@@ -52,13 +52,36 @@ The `#[tool_handler]` macro on `ServerHandler` picks it up automatically.
 
 ## Database changes
 
-Add a new migration file: `migrations/002_your_change.sql`
+`mem` uses a versioned migration system keyed on SQLite's `PRAGMA user_version`. Each migration file is gated by a version check so it only runs once.
 
-Then load it in `db.rs` alongside the existing `include_str!`:
+To add a migration:
+
+1. Create `migrations/003_your_change.sql` (increment the number)
+2. Wrap the DDL in a transaction and advance `user_version` **outside** the transaction:
+
+```sql
+-- Migration 003: describe your change
+-- Applied only when PRAGMA user_version < 3
+
+BEGIN;
+
+ALTER TABLE memories ADD COLUMN your_column TEXT;
+
+COMMIT;
+
+-- user_version must be set outside the transaction for atomicity
+PRAGMA user_version = 3;
+```
+
+3. In `db.rs`, add a version-gated call alongside the existing migration checks:
 
 ```rust
-conn.execute_batch(include_str!("../migrations/002_your_change.sql"))?;
+if user_version < 3 {
+    conn.execute_batch(include_str!("../migrations/003_your_change.sql"))?;
+}
 ```
+
+Do not use `conn.execute_batch` for the full migration chain without version gates — each migration must be idempotent and applied only once.
 
 ## Testing
 

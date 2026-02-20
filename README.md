@@ -107,6 +107,28 @@ Claude Code session
 
 Storage: `~/.mem/mem.db` — single SQLite file, WAL mode, FTS5 full-text search with porter stemming.
 
+## Memory lifecycle
+
+Every memory has a **scope** (project or global) and a **status** (active or cold).
+
+**Scope** controls visibility:
+- `project` (default) — only visible when searching within that project
+- `global` — visible across all projects; use for cross-cutting rules and conventions
+
+**Status** tracks freshness via Ebbinghaus-style decay:
+- `active` — returned in search and context queries
+- `cold` — archived; excluded from results but not deleted
+
+The retention score formula used by `mem decay` is:
+
+```
+retention = (access_count + 1) / (1 + days_since_created × 0.05)
+```
+
+Memories that accumulate access events decay slower. Run `mem decay --dry-run` to preview what would be archived before committing.
+
+**Suggest-rules** analyses auto-captured memories for recurring terms and bigrams (pure frequency — no LLM) and outputs CLAUDE.md-ready markdown you can paste directly.
+
 ## MCP server
 
 `mem` also runs as a Model Context Protocol (MCP) server so agents can explicitly search or save memories.
@@ -121,16 +143,19 @@ Add to `~/.claude/settings.json` or a project `.mcp.json`:
 }
 ```
 
-**6 tools:**
+**9 tools:**
 
 | Tool | Purpose |
 |------|---------|
 | `mem_save` | Save a memory manually (decision, pattern, finding) |
-| `mem_search` | Full-text search with FTS5 query syntax |
-| `mem_context` | Load last N memories for a project |
+| `mem_search` | Full-text search with FTS5 query syntax; includes global memories |
+| `mem_context` | Load last N memories for a project; includes global memories |
 | `mem_get` | Fetch a memory by ID |
-| `mem_stats` | Database statistics |
+| `mem_stats` | Database statistics (active/cold counts, projects, DB size) |
 | `mem_session_start` | Register session start with optional goal |
+| `mem_promote` | Promote a memory to global scope |
+| `mem_demote` | Demote a memory back to project scope |
+| `mem_suggest_rules` | Suggest CLAUDE.md rules from recurring session patterns |
 
 ## CLI
 
@@ -146,13 +171,23 @@ mem save \
   --content "sqlx adds 3s subprocess startup; rusqlite sync = 40ms" \
   --memory-type decision
 
+# Memory lifecycle
+mem decay --dry-run                  # preview what would be archived
+mem decay --threshold 0.1            # archive low-retention memories
+mem promote <id>                     # make a memory visible across all projects
+mem demote <id>                      # return a memory to project scope
+
+# Suggest CLAUDE.md rules from session patterns
+mem suggest-rules                    # analyse last 20 auto-captured memories
+mem suggest-rules --limit 50         # analyse more sessions
+
 # Test your hook setup
 echo '{"cwd":"/your/project"}' | mem save --auto
 echo '{"cwd":"/your/project"}' | mem context --compact
 
 # Verify DB directly
 sqlite3 ~/.mem/mem.db \
-  "SELECT title, type, created_at FROM memories ORDER BY created_at DESC LIMIT 10;"
+  "SELECT title, type, status, scope, created_at FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ## Project context injection
@@ -182,21 +217,23 @@ Now every new Claude Code session opens with the last 3 session summaries alread
 
 ```
 src/
-  main.rs        CLI — subcommands: mcp, save, context, search, stats, tui
-  types.rs       Shared types: Memory, MemoryType, HookStdin, CompactContextOutput
-  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries
+  main.rs        CLI — subcommands: mcp, save, context, search, stats, decay, promote, demote, suggest-rules, tui
+  types.rs       Shared types: Memory, MemoryType, MemoryStatus, MemoryScope, HookStdin, CompactContextOutput
+  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic
   auto.rs        Auto-capture — hook stdin parsing, git diff, title generation
-  mcp.rs         MCP server — rmcp 0.16, 6 tools, stdio transport
-  tui.rs         Interactive TUI — ratatui (v0.2)
+  mcp.rs         MCP server — rmcp 0.16, 9 tools, stdio transport
+  suggest.rs     Rule suggestion engine — pure frequency analysis, no LLM
+  tui.rs         Interactive TUI (not yet implemented)
 migrations/
   001_init.sql   Schema: memories + FTS5 triggers + sessions
+  002_decay_scope.sql  Adds access_count, last_accessed_at, status, scope columns
 hooks/
   mem-stop.sh           Stop hook wrapper
   mem-precompact.sh     PreCompact hook wrapper
   mem-session-start.sh  SessionStart hook wrapper
 ```
 
-**Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap) · [`ratatui`](https://crates.io/crates/ratatui) (v0.2 TUI)
+**Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap)
 
 ## Design goals
 
@@ -207,7 +244,7 @@ hooks/
 | Context on start | Agent must call | **Automatic (SessionStart)** |
 | System deps | Varies | **None (bundled SQLite)** |
 | Search | Varies | **FTS5 + porter stemmer** |
-| MCP tools | Varies | **6 built-in tools** |
+| MCP tools | Varies | **9 built-in tools** |
 
 ## Contributing
 
