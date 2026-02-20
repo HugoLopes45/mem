@@ -6,7 +6,7 @@
 
 **`mem` gives Claude Code a persistent memory that survives session ends, context compaction, and restarts — with zero agent cooperation.**
 
-It hooks into Claude Code's `Stop`, `PreCompact`, and `SessionStart` events to automatically capture and restore session context. No `mem_save` calls. No setup per-project. Just install and wire the hooks once.
+It hooks into Claude Code's `Stop`, `PreCompact`, and `SessionStart` events to automatically capture and restore session context. No `mem_save` calls. No setup per-project. Just install once.
 
 ```
 $ mem search "auth middleware"
@@ -36,17 +36,24 @@ The agent must decide what's worth saving. Remember to call `mem_save`. Load mem
 `mem` removes the agent from the equation entirely. Claude Code's own hooks fire at session boundaries — reliably, automatically, whether the agent cooperates or not. The infrastructure captures memory. You never lose context again.
 
 ```
-$ mem stats
-Memories: 47 active, 3 cold
-Projects: 6
-Sessions: 31 captured
-Last: your-api — 2026-02-20 (3 files, 89 insertions)
+$ mem status
+Binary   : /Users/you/.cargo/bin/mem
+Hooks    : installed
+
+Database : ~/.mem/mem.db
+Memories : 47 (44 active, 3 cold)
+Sessions : 31
+Projects : 6
+DB size  : 128 KB
+Last cap : 2026-02-20 18:42 UTC
+
+Analytics: Cache efficiency 73.2%, avg 12 turns/session
 ```
 
 ### What you get back
 
-- **Session continuity** — every new session opens with the last 3 sessions already in context
-- **Compaction survival** — PreCompact hook injects recent memories *before* the window is truncated
+- **Session continuity** — every new session opens with project MEMORY.md + last 3 session summaries already in context
+- **Compaction survival** — PreCompact hook injects MEMORY.md + recent memories *before* the window is truncated
 - **Zero overhead** — no `mem_save` calls, no per-project setup, no agent discipline required
 - **Full-text search** — FTS5 + porter stemming across everything ever captured, including MEMORY.md files
 - **Cross-project MEMORY.md index** — `mem index` indexes all `~/.claude/projects/*/memory/MEMORY.md` files; search finds lessons across every project instantly
@@ -111,7 +118,9 @@ Three hooks. Zero agent involvement.
 Claude Code session
   │
   ├─ SessionStart hook  ← fires before Claude sees anything
-  │     → reads project MEMORY.md + last 3 session summaries from ~/.mem/mem.db
+  │     → runs: mem session-start
+  │     → reads project MEMORY.md + global ~/.claude/MEMORY.md
+  │     → loads last 3 session summaries from ~/.mem/mem.db
   │     → outputs {"systemMessage":"..."} — injected directly into Claude's context
   │     → Claude opens with full context, zero file boilerplate
   │
@@ -119,14 +128,17 @@ Claude Code session
   │     → agent can also call MCP tools explicitly (mem_search, mem_save…)
   │
   ├─ PreCompact hook  ← fires before context window is truncated
-  │     → injects recent memories as {"additionalContext": "..."}
+  │     → runs: mem context --compact
+  │     → injects project MEMORY.md + recent memories as {"additionalContext": "..."}
   │     → Claude Code merges this into post-compaction context
   │     → nothing is lost when the window fills up
   │
   └─ Stop hook  ← fires when session ends, with or without agent cooperation
+        → runs: mem auto
         → parses hook stdin: cwd, session_id, transcript_path
         → captures git log (committed work) + git diff --stat
-        → parses transcript for token usage and turn counts
+        → parses transcript for token usage, turn counts, and Claude's last message
+        → title uses Claude's own session summary as priority 1
         → writes structured memory to ~/.mem/mem.db
         → no agent call required, no agent discipline required
 ```
@@ -209,7 +221,7 @@ mem index                            # index all ~/.claude/projects/*/memory/MEM
 mem index --dry-run                  # preview what would be indexed (new / updated / unchanged)
 mem index --path /path/to/MEMORY.md  # index a single file
 
-# search now queries both auto-captured memories AND indexed MEMORY.md files
+# search queries both auto-captured memories AND indexed MEMORY.md files
 mem search "biome non-null"          # returns results from any project's MEMORY.md
 
 # Manual save
@@ -235,6 +247,7 @@ mem gain                             # token usage, cache efficiency, top projec
 # Test your hook setup
 echo '{"cwd":"/your/project"}' | mem auto
 echo '{"cwd":"/your/project"}' | mem context --compact
+echo '{"cwd":"/your/project"}' | mem session-start
 
 # Verify DB directly
 sqlite3 ~/.mem/mem.db \
@@ -268,9 +281,9 @@ migrations/
   001_init.sql   Canonical schema: sessions + memories + FTS5 triggers + indexes
   002_indexed_files.sql  indexed_files table + FTS5 + sync triggers
 hooks/
-  mem-stop.sh           Stop hook wrapper
-  mem-precompact.sh     PreCompact hook wrapper
-  mem-session-start.sh  SessionStart hook wrapper (outputs systemMessage JSON)
+  mem-stop.sh           Stop hook script (pipes stdin → mem auto)
+  mem-precompact.sh     PreCompact hook script (pipes stdin → mem context --compact)
+  mem-session-start.sh  SessionStart hook script (pipes stdin → mem session-start → JSON stdout)
 ```
 
 **Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap)
@@ -280,7 +293,7 @@ hooks/
 | | Manual memory tools | **mem** |
 |--|---------------------|---------|
 | Capture trigger | Agent must call | **Hook — fires automatically** |
-| Survives compaction | No | **Yes — PreCompact hook injects context** |
+| Survives compaction | No | **Yes — PreCompact injects MEMORY.md + recent memories** |
 | Context on start | Agent must call | **Automatic — SessionStart injects systemMessage** |
 | System deps | Varies | **None — bundled SQLite binary** |
 | Memory freshness | Never expires | **Ebbinghaus decay — accessed memories stay, stale ones archive** |

@@ -28,18 +28,20 @@ case "$OS" in
   *) error "Unsupported OS: $OS. Build from source: cargo install --git https://github.com/$REPO" ;;
 esac
 
-# ── Fetch latest release ───────────────────────────────────────────────────────
-info "Fetching latest release..."
-if command -v curl >/dev/null 2>&1; then
-  FETCH="curl -fsSL"
-elif command -v wget >/dev/null 2>&1; then
-  FETCH="wget -qO-"
-else
+# ── Fetch latest release ──────────────────────────────────────────────────────
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   error "curl or wget required"
 fi
 
-LATEST=$($FETCH "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+info "Fetching latest release..."
+LATEST=""
+if command -v curl >/dev/null 2>&1; then
+  LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/' || true)
+else
+  LATEST=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/' || true)
+fi
 
 INSTALLED_VIA=""
 
@@ -53,7 +55,7 @@ install_from_source() {
 }
 
 if [ -z "$LATEST" ]; then
-  install_from_source "No release found."
+  install_from_source "No pre-built release found (network issue or no release yet)."
 else
   ARCHIVE="${BIN_NAME}-${LATEST}-${TARGET}.tar.gz"
   URL="https://github.com/$REPO/releases/download/${LATEST}/${ARCHIVE}"
@@ -64,18 +66,18 @@ else
 
   downloaded=0
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$TMP/$ARCHIVE" "$URL" 2>/dev/null && downloaded=1
+    curl -fsSL -o "$TMP/$ARCHIVE" "$URL" && downloaded=1 || warn "curl download failed: $URL"
   else
-    wget -q -O "$TMP/$ARCHIVE" "$URL" 2>/dev/null && downloaded=1
+    wget -q -O "$TMP/$ARCHIVE" "$URL" && downloaded=1 || warn "wget download failed: $URL"
   fi
 
-  if [ "$downloaded" = "1" ] && tar -xzf "$TMP/$ARCHIVE" -C "$TMP" 2>/dev/null; then
+  if [ "$downloaded" = "1" ] && tar -xzf "$TMP/$ARCHIVE" -C "$TMP"; then
     mkdir -p "$INSTALL_DIR"
     mv "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
     chmod +x "$INSTALL_DIR/$BIN_NAME"
     INSTALLED_VIA="binary"
   else
-    install_from_source "Pre-built binary unavailable for $TARGET."
+    install_from_source "Pre-built binary unavailable for $TARGET — falling back to source."
   fi
 fi
 

@@ -10,12 +10,19 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `mem init` — atomically patches `~/.claude/settings.json` with all three hooks (SessionStart, Stop, PreCompact auto+manual). Idempotent. Resolves binary path dynamically via `current_exe()`. Called automatically by `install.sh` — zero manual JSON editing.
 - `mem session-start` — SessionStart hook handler. Outputs `{"systemMessage":"..."}` JSON containing project MEMORY.md + global `~/.claude/MEMORY.md` + last 3 DB captures. Falls back to empty string on any error; always exits 0.
-- `mem status` — shows binary path, hook install state, DB statistics (memories, sessions, projects, DB size, last capture time), and cache efficiency.
-- `find_project_memory_md()` in `auto.rs` — two-strategy MEMORY.md lookup: git repo root first, then `~/.claude/projects/<encoded>/memory/MEMORY.md`.
+- `mem status` — shows binary path, hook install state, DB statistics (memories, sessions, projects, DB size, last capture time), and cache efficiency. Distinguishes missing, unreadable, and malformed `settings.json` with actionable messages.
+- `find_project_memory_md()` in `auto.rs` — two-strategy MEMORY.md lookup: git repo root first, then `~/.claude/projects/<encoded>/memory/MEMORY.md`. Logs warnings on read/canonicalize failure instead of silently returning `None`.
 - `last_capture_time()` DB method — returns the timestamp of the most recent auto-captured memory.
 - `SessionStartOutput` type in `types.rs` — `{"systemMessage":"..."}` protocol struct.
-- `install.sh` calls `mem init` automatically after binary install — one curl command fully wires everything.
-- 20 new tests: `build_title` with session_summary (priority 1), truncation, first-line extraction; `find_project_memory_md` (absent, non-git); `cmd_init` (adds hooks, idempotent, preserves existing keys); `check_mem_hooks_present`; `last_capture_time`.
+- `install.sh` calls `mem init` automatically after binary install — one curl command fully wires everything. Falls back to `cargo install` when no pre-built release is available.
+- `mem index` — scan all `~/.claude/projects/*/memory/MEMORY.md` files and index them into a new `indexed_files` FTS5 table. Supports `--dry-run` (preview with accurate new/updated/unchanged status) and `--path <file>` (single-file mode).
+- `mem search` now queries both auto-captured memories **and** indexed MEMORY.md files in a single unified result set, interleaved by relevance. Results are labelled `[MEMORY.md: <project>]` to distinguish source.
+- `--project` filter on `mem search` now applies to both memories and indexed files (previously only filtered memories).
+- `MEM_CLAUDE_DIR` env var — override the Claude Code projects root used by `mem index` (default: `~/.claude/projects/`). Useful for CI and tests.
+- Migration `002_indexed_files.sql` — `indexed_files` table with FTS5 virtual table, three sync triggers (insert/delete/update), and a `project_name` index. Applied via table-existence check rather than `user_version`.
+- `read_mtime_secs()` helper in `auto.rs` — replaces the silent `.ok().and_then()` mtime chain; now logs a warning at each failure point so the `Unchanged` optimisation is never silently broken.
+- `IndexStats::record()` — enforces counter/entries consistency at every mutation site; `skipped` entries are counted but excluded from the display list.
+- 31 new tests (118 → 149 total): `build_title` boundary (100-char, 101-char); `apply_hooks_to_settings` partial hooks, malformed JSON; `session_start_output` serialization key; `cmd_context --compact` output structure; `find_project_memory_md` edge cases; `last_capture_time`; `decode_project_path` edge cases; FTS trigger correctness; `search_unified` edge cases; `list_indexed_files` ordering; `extract_title` negative cases.
 
 ### Changed
 - `build_title` priority: session summary (Claude's last message, first line, 100-char truncation) → commit message → diff stat → fallback. Previously: commit message was priority 1.
@@ -23,30 +30,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `cmd_context --compact` now prepends `# Project Memory\n\n{MEMORY.md content}` before recent captures.
 - `cmd_init` extracted into `apply_hooks_to_settings(&Path)` (SRP) — `cmd_init` resolves path and prints; the settings-patching logic is reusable and directly testable.
 - `map_or(false, ...)` → `is_some_and(...)` throughout (idiomatic Rust 1.70+).
-- `hooks/mem-session-start.sh` simplified: pipes stdin → `mem session-start` → stdout JSON. No longer writes `.mem-context.md`.
+- `hooks/mem-session-start.sh` simplified: pipes stdin → `mem session-start` → stdout JSON.
+- `search_indexed_files` signature gains a `project: Option<&str>` parameter for `--project` scoping.
+- `search_unified` now queries each source for up to `limit` results (was `limit/2`) so neither source is starved when the other returns few matches.
+- `decode_project_path` now logs a warning when `sessions-index.json` exists but fails to parse, before falling back to the hyphen-decode strategy.
+- Non-UTF-8 project directory names are now logged and skipped (previously stored an empty string as `project_name`).
+- `DirEntry` iteration errors in `scan_and_index_memory_files_in` now increment `stats.skipped` and emit a warning (previously silently continued).
+- `file_mtime` column renamed to `file_mtime_secs` in DB and `IndexedFile` struct — unit (Unix seconds) is now explicit.
+- Migration gate uses `sqlite_master` table-existence check and propagates query errors with `?` instead of `.unwrap_or(0)`.
+
+### Fixed
+- `--global` flag on `mem init` removed — it was declared but silently ignored. `mem init` always patches `~/.claude/settings.json`.
+- `cmd_session_start` cwd fallback used `unwrap_or_default()` (empty PathBuf) — now falls back to `current_dir()?` which propagates the real error.
+- `cmd_session_start` JSON serialization used `?` — could exit non-zero even inside the fallback path. Now uses `unwrap_or_else` (serialization of a `String` field cannot fail).
+- `apply_hooks_to_settings` orphaned `.json.tmp` on rename failure — now removed on error.
+- `hooks/mem-session-start.sh` had `2>/dev/null` — suppressed all warnings from `mem session-start`. Removed; warnings now surface in `claude --debug`.
+- `hooks/mem-session-start.sh` had `MEM_BIN` env var — hook uses `mem` directly since `mem init` wires the full binary path into settings.json.
 
 ### Removed
 - `.mem-context.md` file-write pattern — replaced by `systemMessage` JSON protocol (native Claude Code API, no extra file or `@`-include needed).
-- Dead `MEM_BIN` env var from configuration table — hook scripts now use the wired binary path from `mem init`.
-
-- `mem index` — scan all `~/.claude/projects/*/memory/MEMORY.md` files and index them into a new `indexed_files` FTS5 table. Supports `--dry-run` (preview with accurate new/updated/unchanged status) and `--path <file>` (single-file mode).
-- `mem search` now queries both auto-captured memories **and** indexed MEMORY.md files in a single unified result set, interleaved by relevance. Results are labelled `[MEMORY.md: <project>]` to distinguish source.
-- `--project` filter on `mem search` now applies to both memories and indexed files (previously only filtered memories).
-- `MEM_CLAUDE_DIR` env var — override the Claude Code projects root used by `mem index` (default: `~/.claude/projects/`). Useful for CI and tests.
-- Migration `002_indexed_files.sql` — `indexed_files` table with FTS5 virtual table, three sync triggers (insert/delete/update), and a `project_name` index. Applied via table-existence check rather than `user_version` to handle databases created before the schema squash.
-- `read_mtime_secs()` helper in `auto.rs` — replaces the silent `.ok().and_then()` mtime chain; now logs a warning at each failure point (stat, modified(), epoch conversion) so the `Unchanged` optimisation is never silently broken.
-- `IndexStats::record()` — enforces counter/entries consistency at every mutation site; `skipped` entries are counted but excluded from the display list.
-- 12 new tests (118 → 130 total): project filter on indexed-file search, FTS trigger correctness after update, `search_unified` edge cases (only memories, only files, limit enforcement), `list_indexed_files` ordering, scan Unchanged/Updated paths, `decode_project_path` edge cases (empty entries, malformed JSON), `extract_title` negative cases (H2, no space after `#`).
-
-### Changed
-- `search_indexed_files` signature gains a `project: Option<&str>` parameter for `--project` scoping.
-- `search_unified` now queries each source for up to `limit` results (was `limit/2`) so neither source is starved when the other returns few matches.
-- `decode_project_path` now logs a warning (`[mem] warn: malformed sessions-index.json`) when the JSON file exists but fails to parse, before falling back to the naive hyphen-decode strategy.
-- Non-UTF-8 project directory names are now logged and skipped (previously stored an empty string as `project_name`).
-- `DirEntry` iteration errors in `scan_and_index_memory_files_in` now increment `stats.skipped` and emit a warning (previously silently continued).
-- `file_mtime` column renamed to `file_mtime_secs` in the DB and `IndexedFile` struct — unit (Unix seconds) is now explicit in both name and doc comment.
-- Migration gate uses `sqlite_master` table-existence check and propagates query errors with `?` instead of `.unwrap_or(0)`.
-- Doc comment for `decode_project_path` Strategy 2 corrected: was "prepend nothing"; now accurately describes "strip leading `-`, replace remaining `-` with `/`, prepend `/`".
 
 ## [0.3.0] — 2026-02-20
 
