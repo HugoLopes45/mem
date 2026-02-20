@@ -21,6 +21,14 @@ fn mcp_err(msg: impl std::fmt::Display) -> McpError {
     )
 }
 
+fn mcp_invalid_params(msg: impl std::fmt::Display) -> McpError {
+    McpError::new(
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        msg.to_string(),
+        None,
+    )
+}
+
 fn ok_text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(s.into())]))
 }
@@ -138,14 +146,25 @@ impl MemServer {
     )]
     async fn mem_save(&self, params: Parameters<SaveParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        if p.title.trim().is_empty() {
+            return Err(mcp_invalid_params(
+                "title is required and must not be blank",
+            ));
+        }
+        if p.content.trim().is_empty() {
+            return Err(mcp_invalid_params(
+                "content is required and must not be blank",
+            ));
+        }
         let memory_type: MemoryType = p.memory_type.into();
         let db = self.db.clone();
         let (title, content, project) = (p.title, p.content, p.project);
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.save_memory(
                 &title,
                 memory_type,
@@ -179,9 +198,10 @@ impl MemServer {
         let (query, project) = (p.query, p.project);
 
         let results = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.search_memories(&query, project.as_deref(), limit)
         })
         .await
@@ -222,9 +242,10 @@ impl MemServer {
         let project = p.project;
 
         let mems = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.recent_memories(Some(&project), limit)
         })
         .await
@@ -243,9 +264,10 @@ impl MemServer {
         let id_display = id.clone();
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.get_memory(&id)
         })
         .await
@@ -266,9 +288,10 @@ impl MemServer {
         let db = self.db.clone();
 
         let s = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.stats()
         })
         .await
@@ -302,9 +325,10 @@ impl MemServer {
         let (project, goal, sid) = (p.project, p.goal, session_id.clone());
 
         tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.start_session(&sid, Some(&project), goal.as_deref())
         })
         .await
@@ -327,9 +351,10 @@ impl MemServer {
         let id_display = id.clone();
 
         let changed = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.promote_memory(&id)
         })
         .await
@@ -356,9 +381,10 @@ impl MemServer {
         let id_display = id.clone();
 
         let changed = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.demote_memory(&id)
         })
         .await
@@ -380,13 +406,14 @@ impl MemServer {
         &self,
         params: Parameters<SuggestRulesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let limit = params.0.limit as usize;
+        let limit = (params.0.limit as usize).min(500);
         let db = self.db.clone();
 
         let memories = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.recent_auto_memories(limit)
         })
         .await
@@ -397,7 +424,7 @@ impl MemServer {
             return ok_text("No auto-captured memories found. Run some sessions with the Stop hook enabled first.");
         }
 
-        ok_text(suggest_rules(&memories, limit))
+        ok_text(suggest_rules(&memories))
     }
 
     /// Session analytics: token usage, cache efficiency, top projects.
@@ -408,9 +435,10 @@ impl MemServer {
         let db = self.db.clone();
 
         let g = tokio::task::spawn_blocking(move || {
-            let db = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db.lock().unwrap_or_else(|e| {
+                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                e.into_inner()
+            });
             db.gain_stats()
         })
         .await

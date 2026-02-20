@@ -205,6 +205,9 @@ fn cmd_save_manual(
     let title = title.context("--title required for manual save")?;
     let content = content.context("--content required for manual save")?;
     let mt: MemoryType = memory_type.parse()?;
+    if mt == MemoryType::Auto {
+        anyhow::bail!("'auto' is reserved for Stop hook capture via `mem auto`; valid values: manual, pattern, decision");
+    }
     let project_str = project
         .as_deref()
         .and_then(|p| auto::git_repo_root(p).or_else(|| p.to_str().map(String::from)));
@@ -371,7 +374,7 @@ fn cmd_suggest_rules(db_path: PathBuf, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    let output = suggest::suggest_rules(&memories, limit);
+    let output = suggest::suggest_rules(&memories);
     print!("{output}");
     Ok(())
 }

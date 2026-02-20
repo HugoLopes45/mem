@@ -9,6 +9,10 @@
 use crate::types::Memory;
 use std::collections::HashMap;
 
+// Two categories:
+// 1. English stop words — high-frequency grammatical words that carry no topical signal.
+// 2. Domain noise — terms that appear in every auto-capture (boilerplate from build_content),
+//    such as "session", "git", "captured". Filtering these prevents false rule suggestions.
 const STOP_WORDS: &[&str] = &[
     // English stop words
     "the", "a", "an", "is", "was", "to", "in", "of", "and", "or", "with", "for", "on", "at", "be",
@@ -36,16 +40,29 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract bigrams from a token list.
-fn bigrams(tokens: &[String]) -> Vec<String> {
-    tokens
+/// Extract bigrams from the pre-filter token list, emitting only pairs where both
+/// tokens survive stop-word filtering. This prevents false bigrams like "tokio runtime"
+/// from a phrase "tokio and runtime" (where "and" was filtered away between them).
+fn bigrams_filtered(
+    raw_tokens: &[String],
+    token_set: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    raw_tokens
         .windows(2)
-        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .filter_map(|pair| {
+            let a = pair[0].as_str();
+            let b = pair[1].as_str();
+            if token_set.contains(a) && token_set.contains(b) {
+                Some(format!("{a} {b}"))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
 /// Analyse memories and return CLAUDE.md-ready markdown suggestions.
-pub fn suggest_rules(memories: &[Memory], analysed_limit: usize) -> String {
+pub fn suggest_rules(memories: &[Memory]) -> String {
     let count = memories.len();
 
     // token → set of memory indices that contain it (for per-memory frequency)
@@ -54,8 +71,23 @@ pub fn suggest_rules(memories: &[Memory], analysed_limit: usize) -> String {
 
     for (idx, mem) in memories.iter().enumerate() {
         let combined = format!("{} {}", mem.title, mem.content);
+        // Bigrams computed on the raw (pre-filter) token list, then checked that both
+        // constituent tokens survive stop-word filtering before the bigram is emitted.
+        let raw_tokens: Vec<String> = combined
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter_map(|tok| {
+                let lower = tok.to_lowercase();
+                if lower.len() >= 3 {
+                    Some(lower)
+                } else {
+                    None
+                }
+            })
+            .collect();
         let tokens = tokenize(&combined);
-        let bgs = bigrams(&tokens);
+        let token_set: std::collections::HashSet<&str> =
+            tokens.iter().map(|t| t.as_str()).collect();
+        let bgs = bigrams_filtered(&raw_tokens, &token_set);
 
         let mut seen_tokens = std::collections::HashSet::new();
         for tok in tokens {
@@ -92,7 +124,7 @@ pub fn suggest_rules(memories: &[Memory], analysed_limit: usize) -> String {
     let today = chrono::Utc::now().format("%Y-%m-%d");
     let mut out = format!(
         "## Suggested rules (from mem pattern analysis)\n\
-         <!-- based on {count} sessions, {today} (analysed last {analysed_limit} auto-captured memories) -->\n\n"
+         <!-- based on {count} sessions, {today} -->\n\n"
     );
 
     if unigram_candidates.is_empty() && bigram_candidates.is_empty() {
@@ -177,7 +209,7 @@ mod tests {
             ),
         ];
 
-        let output = suggest_rules(&memories, 20);
+        let output = suggest_rules(&memories);
         assert!(
             output.contains("jwt"),
             "output should mention jwt: {output}"
@@ -188,7 +220,7 @@ mod tests {
     #[test]
     fn suggest_rules_emits_markdown_header() {
         let memories = vec![make_memory("title a", "content a")];
-        let output = suggest_rules(&memories, 20);
+        let output = suggest_rules(&memories);
         assert!(output.contains("## Suggested rules"));
         assert!(output.contains("from mem pattern analysis"));
     }
@@ -200,7 +232,7 @@ mod tests {
             make_memory("alpha bravo charlie", "delta echo foxtrot"),
             make_memory("golf hotel india", "juliet kilo lima"),
         ];
-        let output = suggest_rules(&memories, 20);
+        let output = suggest_rules(&memories);
         assert!(output.contains("No recurring patterns"));
     }
 
@@ -210,7 +242,7 @@ mod tests {
             make_memory("tokio runtime setup", "configured tokio runtime async"),
             make_memory("tokio runtime config", "tokio runtime handles threads"),
         ];
-        let output = suggest_rules(&memories, 20);
+        let output = suggest_rules(&memories);
         // "tokio runtime" bigram should appear (2 memories)
         assert!(
             output.contains("tokio runtime"),
@@ -237,10 +269,25 @@ mod tests {
             "tokio runtime setup",
             "tokio runtime handles async",
         )];
-        let output = suggest_rules(&memories, 20);
+        let output = suggest_rules(&memories);
         assert!(
             !output.contains("tokio runtime"),
             "bigram in only 1 memory must not be suggested"
+        );
+    }
+
+    #[test]
+    fn bigram_not_emitted_when_stop_word_between_tokens() {
+        // "tokio and runtime" — "and" is a stop word filtered between tokio and runtime,
+        // so "tokio runtime" must NOT appear as a bigram (they were not adjacent).
+        let memories = vec![
+            make_memory("tokio and runtime setup", "tokio and runtime async"),
+            make_memory("tokio and runtime config", "tokio and runtime threads"),
+        ];
+        let output = suggest_rules(&memories);
+        assert!(
+            !output.contains("tokio runtime"),
+            "bigram must not be emitted when stop word separates tokens: {output}"
         );
     }
 }
