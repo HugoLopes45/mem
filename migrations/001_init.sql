@@ -1,9 +1,21 @@
 -- mem: persistent memory for Claude Code sessions
 -- Storage: SQLite WAL + FTS5
 
+-- Session tracking (created first; memories.session_id references this table)
+CREATE TABLE IF NOT EXISTS sessions (
+    id         TEXT PRIMARY KEY,
+    project    TEXT,
+    goal       TEXT,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,
+    turn_count INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id         TEXT PRIMARY KEY,
-    session_id TEXT,
+    -- ON DELETE SET NULL: deleting a session leaves its memories intact (orphaned sessions
+    -- are not expected in normal operation, but the FK guards against dangling references).
+    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
     project    TEXT,
     title      TEXT NOT NULL,
     type       TEXT NOT NULL CHECK(type IN ('auto','manual','pattern','decision')),
@@ -21,7 +33,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     tokenize='porter unicode61'
 );
 
--- Triggers to keep FTS index in sync
+-- Triggers to keep FTS index in sync.
+-- IMPORTANT: Any direct UPDATE to memories.title or memories.content in db.rs
+-- must go through these triggers — bypassing them (e.g. raw execute without UPDATE)
+-- would leave the FTS index out of sync. Always use the trigger-covered UPDATE path.
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, title, content)
     VALUES (new.rowid, new.title, new.content);
@@ -38,16 +53,6 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memories_fts(rowid, title, content)
     VALUES (new.rowid, new.title, new.content);
 END;
-
--- Session tracking
-CREATE TABLE IF NOT EXISTS sessions (
-    id         TEXT PRIMARY KEY,
-    project    TEXT,
-    goal       TEXT,
-    started_at TEXT NOT NULL,
-    ended_at   TEXT,
-    turn_count INTEGER DEFAULT 0
-);
 
 -- Index for project-scoped queries
 CREATE INDEX IF NOT EXISTS memories_project_idx ON memories(project, created_at DESC);

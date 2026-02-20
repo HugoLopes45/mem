@@ -11,7 +11,3 @@ ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'
     CHECK(scope IN ('project', 'global'));
 
 COMMIT;
-
--- PRAGMA user_version does not participate in SQLite transactions; set it
--- separately after the DDL batch succeeds so atomicity is preserved.
-PRAGMA user_version = 2;

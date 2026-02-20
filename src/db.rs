@@ -10,6 +10,8 @@ use crate::types::{
 };
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
+const MIGRATION_002: &str = include_str!("../migrations/002_decay_scope.sql");
+const MIGRATION_003: &str = include_str!("../migrations/003_session_analytics.sql");
 
 pub struct Db {
     conn: Connection,
@@ -24,9 +26,10 @@ impl Db {
         }
         let conn = Connection::open(path).with_context(|| format!("open db {}", path.display()))?;
 
-        // WAL mode for concurrent readers + single writer
+        // WAL mode for concurrent readers + single writer.
+        // busy_timeout=5000 prevents silent SQLITE_BUSY drops when a reader holds a WAL lock.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
 
         // Versioned migrations via PRAGMA user_version
@@ -39,32 +42,15 @@ impl Db {
         }
 
         if version < 2 {
-            conn.execute_batch(
-                "BEGIN;
-                 ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
-                 ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active' \
-                     CHECK(status IN ('active', 'cold'));
-                 ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'project' \
-                     CHECK(scope IN ('project', 'global'));
-                 COMMIT;",
-            )
-            .context("migration 002: schema changes failed")?;
+            conn.execute_batch(MIGRATION_002)
+                .context("migration 002: schema changes failed")?;
             conn.execute_batch("PRAGMA user_version = 2;")
                 .context("migration 002: failed to set user_version")?;
         }
 
         if version < 3 {
-            conn.execute_batch(
-                "BEGIN;
-                 ALTER TABLE sessions ADD COLUMN duration_secs INTEGER;
-                 ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE sessions ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0;
-                 COMMIT;",
-            )
-            .context("migration 003: session analytics columns failed")?;
+            conn.execute_batch(MIGRATION_003)
+                .context("migration 003: session analytics columns failed")?;
             conn.execute_batch("PRAGMA user_version = 3;")
                 .context("migration 003: failed to set user_version")?;
         }
