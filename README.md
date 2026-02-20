@@ -58,10 +58,23 @@ Last: your-api — 2026-02-20 (3 files, 89 insertions)
 ## Install
 
 ```bash
-cargo install --git https://github.com/HugoLopes45/mem
+curl -fsSL https://raw.githubusercontent.com/HugoLopes45/mem/main/install.sh | bash
 ```
 
-No system dependencies. SQLite is statically linked — `cargo install` is all you need.
+One command. Installs the binary and wires all three Claude Code hooks automatically via `mem init`. No JSON editing, no manual hook setup.
+
+No system dependencies — SQLite is statically linked.
+
+<details>
+<summary>Install from source (Rust toolchain required)</summary>
+
+```bash
+cargo install --git https://github.com/HugoLopes45/mem --locked
+mem init
+```
+
+Requires Rust 1.75+.
+</details>
 
 <details>
 <summary>Build from source</summary>
@@ -70,47 +83,25 @@ No system dependencies. SQLite is statically linked — `cargo install` is all y
 git clone https://github.com/HugoLopes45/mem
 cd mem
 cargo build --release
-# binary at: ./target/release/mem
+./target/release/mem init
 ```
 
-Requires Rust 1.75+.
 </details>
 
 ## Quick start
 
-**1. Install `mem`**
+**1. Install and wire**
 
 ```bash
-cargo install --git https://github.com/HugoLopes45/mem
+curl -fsSL https://raw.githubusercontent.com/HugoLopes45/mem/main/install.sh | bash
 ```
 
-**2. Copy hook scripts to a stable location**
+**2. Done.** Every session is now captured automatically.
 
 ```bash
-cp /path/to/mem/hooks/* ~/.claude/hooks/
-chmod +x ~/.claude/hooks/mem-*.sh
+mem status   # verify hooks are installed
+mem gain     # token analytics after a few sessions
 ```
-
-**3. Add to `~/.claude/settings.json`**
-
-```json
-{
-  "hooks": {
-    "Stop": [{
-      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-stop.sh"}]
-    }],
-    "PreCompact": [{
-      "matcher": "auto",
-      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-precompact.sh"}]
-    }],
-    "SessionStart": [{
-      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-session-start.sh"}]
-    }]
-  }
-}
-```
-
-**4. Done.** Every session end is now captured automatically.
 
 ## How it works
 
@@ -120,9 +111,9 @@ Three hooks. Zero agent involvement.
 Claude Code session
   │
   ├─ SessionStart hook  ← fires before Claude sees anything
-  │     → reads last 3 session summaries from ~/.mem/mem.db
-  │     → writes .mem-context.md to project root
-  │     → @-included in CLAUDE.md → Claude opens with full context
+  │     → reads project MEMORY.md + last 3 session summaries from ~/.mem/mem.db
+  │     → outputs {"systemMessage":"..."} — injected directly into Claude's context
+  │     → Claude opens with full context, zero file boilerplate
   │
   ├─ [session runs — agent works normally]
   │     → agent can also call MCP tools explicitly (mem_search, mem_save…)
@@ -204,6 +195,10 @@ Add to `~/.claude/settings.json` or a project `.mcp.json`:
 ## CLI
 
 ```bash
+# Setup
+mem init         # wire hooks into ~/.claude/settings.json (idempotent)
+mem status       # check hook install state + DB stats
+
 # What's been captured
 mem stats
 mem search "database migration"
@@ -246,43 +241,27 @@ sqlite3 ~/.mem/mem.db \
   "SELECT title, type, status, scope, created_at FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
-## Project context injection
-
-`mem-session-start.sh` writes `.mem-context.md` to your project root at each session start. Reference it from your project `CLAUDE.md`:
-
-```markdown
-@.mem-context.md
-```
-
-Add to `.gitignore`:
-
-```
-.mem-context.md
-```
-
-Now every new Claude Code session opens with the last 3 session summaries already in context.
-
 ## Configuration
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `MEM_DB` | `~/.mem/mem.db` | Custom database path |
-| `MEM_BIN` | `mem` | Custom binary path (for hook scripts) |
 | `MEM_CLAUDE_DIR` | `~/.claude/projects/` | Override Claude Code projects root (used by `mem index`; also useful for tests) |
 
 ## Architecture
 
 ```
 src/
-  main.rs        CLI — subcommands: mcp, save, auto, context, search, stats, decay,
-                        promote, demote, suggest-rules, gain, delete, index
+  main.rs        CLI — subcommands: init, session-start, status, mcp, save, auto,
+                        context, search, stats, decay, promote, demote,
+                        suggest-rules, gain, delete, index
   types.rs       Domain types: Memory, MemoryType, MemoryStatus, MemoryScope,
                         IndexedFile, IndexStats, SearchResult, HookStdin,
-                        TranscriptAnalytics, GainStats
+                        TranscriptAnalytics, GainStats, SessionStartOutput
   db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic,
                         indexed_files upsert/search/list, unified search
   auto.rs        Auto-capture — hook stdin parsing, transcript analytics, git diff,
-                        MEMORY.md scanning (decode_project_path, scan_and_index_memory_files)
+                        find_project_memory_md, MEMORY.md scanning
   mcp.rs         MCP server — rmcp 0.16, 10 tools, stdio transport
   suggest.rs     Rule suggestion engine — pure frequency analysis, no LLM
 migrations/
@@ -291,7 +270,7 @@ migrations/
 hooks/
   mem-stop.sh           Stop hook wrapper
   mem-precompact.sh     PreCompact hook wrapper
-  mem-session-start.sh  SessionStart hook wrapper
+  mem-session-start.sh  SessionStart hook wrapper (outputs systemMessage JSON)
 ```
 
 **Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap)
@@ -302,7 +281,7 @@ hooks/
 |--|---------------------|---------|
 | Capture trigger | Agent must call | **Hook — fires automatically** |
 | Survives compaction | No | **Yes — PreCompact hook injects context** |
-| Context on start | Agent must call | **Automatic — SessionStart writes it** |
+| Context on start | Agent must call | **Automatic — SessionStart injects systemMessage** |
 | System deps | Varies | **None — bundled SQLite binary** |
 | Memory freshness | Never expires | **Ebbinghaus decay — accessed memories stay, stale ones archive** |
 | Cross-project memory | No | **Yes — promote any memory to global scope** |

@@ -8,6 +8,27 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `mem init` — atomically patches `~/.claude/settings.json` with all three hooks (SessionStart, Stop, PreCompact auto+manual). Idempotent. Resolves binary path dynamically via `current_exe()`. Called automatically by `install.sh` — zero manual JSON editing.
+- `mem session-start` — SessionStart hook handler. Outputs `{"systemMessage":"..."}` JSON containing project MEMORY.md + global `~/.claude/MEMORY.md` + last 3 DB captures. Falls back to empty string on any error; always exits 0.
+- `mem status` — shows binary path, hook install state, DB statistics (memories, sessions, projects, DB size, last capture time), and cache efficiency.
+- `find_project_memory_md()` in `auto.rs` — two-strategy MEMORY.md lookup: git repo root first, then `~/.claude/projects/<encoded>/memory/MEMORY.md`.
+- `last_capture_time()` DB method — returns the timestamp of the most recent auto-captured memory.
+- `SessionStartOutput` type in `types.rs` — `{"systemMessage":"..."}` protocol struct.
+- `install.sh` calls `mem init` automatically after binary install — one curl command fully wires everything.
+- 20 new tests: `build_title` with session_summary (priority 1), truncation, first-line extraction; `find_project_memory_md` (absent, non-git); `cmd_init` (adds hooks, idempotent, preserves existing keys); `check_mem_hooks_present`; `last_capture_time`.
+
+### Changed
+- `build_title` priority: session summary (Claude's last message, first line, 100-char truncation) → commit message → diff stat → fallback. Previously: commit message was priority 1.
+- `capture_and_save` now parses transcript **before** building title so the session summary is available for `build_title`.
+- `cmd_context --compact` now prepends `# Project Memory\n\n{MEMORY.md content}` before recent captures.
+- `cmd_init` extracted into `apply_hooks_to_settings(&Path)` (SRP) — `cmd_init` resolves path and prints; the settings-patching logic is reusable and directly testable.
+- `map_or(false, ...)` → `is_some_and(...)` throughout (idiomatic Rust 1.70+).
+- `hooks/mem-session-start.sh` simplified: pipes stdin → `mem session-start` → stdout JSON. No longer writes `.mem-context.md`.
+
+### Removed
+- `.mem-context.md` file-write pattern — replaced by `systemMessage` JSON protocol (native Claude Code API, no extra file or `@`-include needed).
+- Dead `MEM_BIN` env var from configuration table — hook scripts now use the wired binary path from `mem init`.
+
 - `mem index` — scan all `~/.claude/projects/*/memory/MEMORY.md` files and index them into a new `indexed_files` FTS5 table. Supports `--dry-run` (preview with accurate new/updated/unchanged status) and `--path <file>` (single-file mode).
 - `mem search` now queries both auto-captured memories **and** indexed MEMORY.md files in a single unified result set, interleaved by relevance. Results are labelled `[MEMORY.md: <project>]` to distinguish source.
 - `--project` filter on `mem search` now applies to both memories and indexed files (previously only filtered memories).
