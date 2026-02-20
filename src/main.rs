@@ -478,3 +478,90 @@ fn efficiency_bar(pct: f64) -> String {
     let empty = 20 - filled;
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_duration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(1), "1s");
+        assert_eq!(format_duration(59), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        // This was the fixed bug: previously emitted "1m" without seconds
+        assert_eq!(format_duration(60), "1m 00s");
+        assert_eq!(format_duration(65), "1m 05s");
+        assert_eq!(format_duration(90), "1m 30s");
+        assert_eq!(format_duration(3599), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(3600), "1h 00m");
+        assert_eq!(format_duration(3660), "1h 01m");
+        assert_eq!(format_duration(3665), "1h 01m"); // seconds dropped at hour scale
+        assert_eq!(format_duration(7200), "2h 00m");
+        assert_eq!(format_duration(7384), "2h 03m");
+    }
+
+    // ── format_tokens ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_tokens_raw_below_thousand() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+    }
+
+    #[test]
+    fn format_tokens_thousands() {
+        assert_eq!(format_tokens(1_000), "1.0K");
+        assert_eq!(format_tokens(1_500), "1.5K");
+        assert_eq!(format_tokens(999_999), "1000.0K");
+    }
+
+    #[test]
+    fn format_tokens_millions() {
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn format_tokens_billions() {
+        assert_eq!(format_tokens(1_000_000_000), "1.0B");
+        assert_eq!(format_tokens(2_000_000_000), "2.0B");
+    }
+
+    // ── efficiency_bar ────────────────────────────────────────────────────────
+
+    #[test]
+    fn efficiency_bar_zero_percent_is_all_empty() {
+        let bar = efficiency_bar(0.0);
+        assert!(!bar.contains('\u{2588}'), "0% should have no filled blocks");
+        assert_eq!(bar.chars().count(), 20);
+    }
+
+    #[test]
+    fn efficiency_bar_hundred_percent_is_all_filled() {
+        let bar = efficiency_bar(100.0);
+        assert!(
+            !bar.contains('\u{2591}'),
+            "100% should have no empty blocks"
+        );
+        assert_eq!(bar.chars().count(), 20);
+    }
+
+    #[test]
+    fn efficiency_bar_fifty_percent_is_half_filled() {
+        let bar = efficiency_bar(50.0);
+        let filled = bar.chars().filter(|&c| c == '\u{2588}').count();
+        let empty = bar.chars().filter(|&c| c == '\u{2591}').count();
+        assert_eq!(filled, 10);
+        assert_eq!(empty, 10);
+    }
+}

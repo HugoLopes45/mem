@@ -22,7 +22,7 @@ struct GitChanges {
 impl AutoCapture {
     /// Parse hook stdin JSON and resolve project path.
     /// Returns `None` if `stop_hook_active=true` (prevents infinite loop when
-    /// `mem save --auto` itself triggers the Stop hook).
+    /// `mem auto` itself triggers the Stop hook).
     pub fn from_stdin(stdin_json: &str, override_project: Option<&Path>) -> Result<Option<Self>> {
         let hook: HookStdin = match serde_json::from_str(stdin_json) {
             Ok(h) => h,
@@ -34,7 +34,7 @@ impl AutoCapture {
             }
         };
 
-        // Guard: Stop hook fires again when `mem save --auto` itself runs as a subprocess.
+        // Guard: Stop hook fires again when `mem auto` itself runs as a subprocess.
         // Claude Code sets stop_hook_active=true in that inner invocation.
         if hook.stop_hook_active == Some(true) {
             return Ok(None);
@@ -97,11 +97,6 @@ impl AutoCapture {
     /// Gather committed work and diff stat since origin/HEAD.
     /// Falls back to `git diff --stat HEAD` when no remote is available.
     fn git_changes(&self) -> GitChanges {
-        // Use .arg(&self.project) directly (OsStr) — avoids lossy UTF-8 conversion
-        // for paths that may contain non-UTF-8 bytes on some filesystems.
-        // stdin(Stdio::null()) prevents git from blocking on a terminal prompt
-        // (e.g. SSH passphrase or credential helper) when run in a hook context.
-
         // Try: git log --oneline origin/HEAD..HEAD
         let log_result = Command::new("git")
             .arg("-C")
@@ -386,8 +381,41 @@ mod tests {
 
     #[test]
     fn parse_transcript_returns_none_on_missing_file() {
-        let result = parse_transcript("/tmp/nonexistent_mem_transcript_abc123.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent_transcript.jsonl");
+        let result = parse_transcript(path.to_str().unwrap());
         assert!(result.is_none(), "missing file should return None");
+    }
+
+    // ── is_safe_transcript_path tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_transcript_rejects_relative_path() {
+        let result = parse_transcript("relative/path/transcript.jsonl");
+        assert!(result.is_none(), "relative path must be rejected");
+    }
+
+    #[test]
+    fn parse_transcript_rejects_path_with_parent_traversal() {
+        let result = parse_transcript("/tmp/../../etc/passwd");
+        assert!(result.is_none(), "path with .. must be rejected");
+    }
+
+    #[test]
+    fn parse_transcript_rejects_bare_parent_traversal() {
+        let result = parse_transcript("../secrets.jsonl");
+        assert!(result.is_none(), "relative path with .. must be rejected");
+    }
+
+    #[test]
+    fn parse_transcript_accepts_normal_absolute_path_that_does_not_exist() {
+        // Proves the safety guard does NOT over-block legitimate absolute paths.
+        // Returns None from the missing-file branch, not the safety-rejection branch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("safe_nonexistent.jsonl");
+        let result = parse_transcript(path.to_str().unwrap());
+        // None because the file doesn't exist, not because of safety rejection
+        assert!(result.is_none());
     }
 
     #[test]

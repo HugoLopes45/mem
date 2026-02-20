@@ -222,6 +222,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_type_from_str_roundtrip() {
+        assert_eq!("auto".parse::<MemoryType>().unwrap(), MemoryType::Auto);
+        assert_eq!("manual".parse::<MemoryType>().unwrap(), MemoryType::Manual);
+        assert_eq!(
+            "pattern".parse::<MemoryType>().unwrap(),
+            MemoryType::Pattern
+        );
+        assert_eq!(
+            "decision".parse::<MemoryType>().unwrap(),
+            MemoryType::Decision
+        );
+        assert!("Manual".parse::<MemoryType>().is_err()); // case-sensitive
+        assert!("unknown".parse::<MemoryType>().is_err());
+    }
+
+    #[test]
+    fn memory_type_display_roundtrip() {
+        for (variant, expected) in [
+            (MemoryType::Auto, "auto"),
+            (MemoryType::Manual, "manual"),
+            (MemoryType::Pattern, "pattern"),
+            (MemoryType::Decision, "decision"),
+        ] {
+            assert_eq!(variant.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn memory_type_error_message_includes_valid_values() {
+        let err = "bogus".parse::<MemoryType>().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manual"),
+            "error should list valid types: {msg}"
+        );
+        assert!(
+            msg.contains("pattern"),
+            "error should list valid types: {msg}"
+        );
+        assert!(
+            msg.contains("decision"),
+            "error should list valid types: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_type_error_message_includes_bad_value() {
+        let err = "bogus_type".parse::<MemoryType>().unwrap_err();
+        assert!(
+            err.to_string().contains("bogus_type"),
+            "error should echo the invalid value"
+        );
+    }
+
+    #[test]
+    fn user_memory_type_does_not_include_auto() {
+        // UserMemoryType exists specifically to exclude MemoryType::Auto from MCP/CLI.
+        // Verify that `auto` cannot deserialize into it.
+        let result = serde_json::from_str::<UserMemoryType>("\"auto\"");
+        assert!(
+            result.is_err(),
+            "UserMemoryType must not accept 'auto': {result:?}"
+        );
+    }
+
+    #[test]
+    fn user_memory_type_default_is_manual() {
+        assert_eq!(UserMemoryType::default(), UserMemoryType::Manual);
+    }
+
+    #[test]
     fn memory_status_from_str_roundtrip() {
         assert_eq!(
             "active".parse::<MemoryStatus>().unwrap(),

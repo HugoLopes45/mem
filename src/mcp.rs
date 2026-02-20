@@ -162,7 +162,7 @@ impl MemServer {
 
         let mem = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.save_memory(
@@ -193,13 +193,16 @@ impl MemServer {
         params: Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        if p.query.trim().is_empty() {
+            return Err(mcp_invalid_params("query must not be blank"));
+        }
         let limit = (p.limit as usize).min(200);
         let db = self.db.clone();
         let (query, project) = (p.query, p.project);
 
         let results = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.search_memories(&query, project.as_deref(), limit)
@@ -243,7 +246,7 @@ impl MemServer {
 
         let mems = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.recent_memories(Some(&project), limit)
@@ -265,7 +268,7 @@ impl MemServer {
 
         let mem = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.get_memory(&id)
@@ -289,7 +292,7 @@ impl MemServer {
 
         let s = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.stats()
@@ -326,7 +329,7 @@ impl MemServer {
 
         tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.start_session(&sid, Some(&project), goal.as_deref())
@@ -352,7 +355,7 @@ impl MemServer {
 
         let changed = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.promote_memory(&id)
@@ -382,7 +385,7 @@ impl MemServer {
 
         let changed = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.demote_memory(&id)
@@ -411,7 +414,7 @@ impl MemServer {
 
         let memories = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.recent_auto_memories(limit)
@@ -436,7 +439,7 @@ impl MemServer {
 
         let g = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex recovered from thread panic — state is intact");
+                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
                 e.into_inner()
             });
             db.gain_stats()
