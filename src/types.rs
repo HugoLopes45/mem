@@ -147,6 +147,13 @@ pub struct CompactContextOutput {
     pub additional_context: String,
 }
 
+/// Output from `mem session-start` — matches Claude Code SessionStart hook protocol.
+#[derive(Debug, Serialize)]
+pub struct SessionStartOutput {
+    #[serde(rename = "systemMessage")]
+    pub system_message: String,
+}
+
 /// Common fields from Claude Code hook stdin JSON.
 // Uses Default so malformed stdin falls back gracefully rather than hard-failing.
 // See auto.rs for why that tradeoff is intentional.

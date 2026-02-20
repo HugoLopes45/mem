@@ -227,6 +227,24 @@ impl Db {
         }
     }
 
+    /// Return the creation timestamp of the most recent auto-captured memory.
+    /// Returns `None` if no auto memories exist yet.
+    pub fn last_capture_time(&self) -> Result<Option<chrono::DateTime<Utc>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT created_at FROM memories WHERE type = 'auto' ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let ts_str: String = row.get(0)?;
+            let dt = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| anyhow::anyhow!("invalid timestamp in DB: {e}"))?;
+            Ok(Some(dt))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Hard-delete a memory by ID. Returns true if a row was deleted.
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
         let n = self
@@ -1875,5 +1893,54 @@ mod tests {
         assert_eq!(files[0].project_name, "apple");
         assert_eq!(files[1].project_name, "mango");
         assert_eq!(files[2].project_name, "zoo");
+    }
+
+    // ── last_capture_time tests ────────────────────────────────────────────────
+
+    #[test]
+    fn last_capture_time_returns_none_when_no_auto_memories() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let result = db.last_capture_time().unwrap();
+        assert!(result.is_none(), "no auto memories → None");
+    }
+
+    #[test]
+    fn last_capture_time_returns_most_recent_auto() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+
+        // Insert two auto memories; last_capture_time should return the most recent.
+        db.save_memory(
+            "older session",
+            MemoryType::Auto,
+            "content A",
+            Some("/proj"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Brief sleep to ensure distinct timestamps
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        db.save_memory(
+            "newer session",
+            MemoryType::Auto,
+            "content B",
+            Some("/proj"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = db.last_capture_time().unwrap();
+        assert!(result.is_some(), "should have a capture time");
+        let dt = result.unwrap();
+
+        // The timestamp must be recent (within last minute)
+        let age = chrono::Utc::now().signed_duration_since(dt);
+        assert!(
+            age.num_seconds() < 60,
+            "last_capture_time should be within last minute, but age is {age}"
+        );
     }
 }

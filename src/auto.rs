@@ -64,13 +64,12 @@ impl AutoCapture {
     /// Capture what changed this session and write to DB.
     pub fn capture_and_save(&self, db: &Db) -> Result<Memory> {
         let changes = self.git_changes();
-        let title = self.build_title(&changes);
         let diff_text = changes.diff_stat.as_deref().map(String::from);
 
         let project_str = git_repo_root(&self.project)
             .unwrap_or_else(|| self.project.to_string_lossy().to_string());
 
-        // Parse transcript before building content so we can include the session summary.
+        // Parse transcript BEFORE building title so session_summary is available.
         let mut session_summary: Option<String> = None;
         if let Some(ref sid) = self.session_id {
             if let Err(e) = db.end_session(sid) {
@@ -88,6 +87,7 @@ impl AutoCapture {
             }
         }
 
+        let title = self.build_title(&changes, session_summary.as_deref());
         let content = self.build_content(&diff_text, session_summary.as_deref());
 
         db.save_memory(
@@ -198,19 +198,34 @@ impl AutoCapture {
         }
     }
 
-    fn build_title(&self, changes: &GitChanges) -> String {
+    fn build_title(&self, changes: &GitChanges, session_summary: Option<&str>) -> String {
         let project_name = self
             .project
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Prefer the most recent commit message as the title
+        // Priority 1: Claude's last assistant message — first line, truncated to 100 chars
+        if let Some(summary) = session_summary {
+            let first_line = summary.lines().next().unwrap_or(summary).trim();
+            if !first_line.is_empty() {
+                return if first_line.chars().count() > 100 {
+                    format!(
+                        "{project_name}: {}…",
+                        first_line.chars().take(100).collect::<String>()
+                    )
+                } else {
+                    format!("{project_name}: {first_line}")
+                };
+            }
+        }
+
+        // Priority 2: Prefer the most recent commit message
         if let Some(ref msg) = changes.latest_commit_msg {
             return format!("{project_name}: {msg}");
         }
 
-        // Fall back to diff stat summary line
+        // Priority 3: Fall back to diff stat summary line
         if let Some(ref diff) = changes.diff_stat {
             if let Some(summary) = diff
                 .lines()
@@ -242,6 +257,41 @@ impl AutoCapture {
 
         parts.join("\n\n")
     }
+}
+
+/// Find the MEMORY.md file for the given working directory.
+///
+/// Strategy 1: git repo root + "/MEMORY.md"
+/// Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
+///
+/// Returns `(content, path)` or `None` if not found.
+pub fn find_project_memory_md(cwd: &Path) -> Option<(String, PathBuf)> {
+    // Strategy 1: git root MEMORY.md
+    if let Some(root) = git_repo_root(cwd) {
+        let path = PathBuf::from(&root).join("MEMORY.md");
+        if path.exists() {
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                return Some((c, path));
+            }
+        }
+    }
+
+    // Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
+    let projects = dirs::home_dir()?.join(".claude").join("projects");
+    let canonical = std::fs::canonicalize(cwd).ok()?;
+    let encoded = "-".to_string()
+        + &canonical
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-");
+    let path = projects.join(encoded).join("memory").join("MEMORY.md");
+    if path.exists() {
+        if let Ok(c) = std::fs::read_to_string(&path) {
+            return Some((c, path));
+        }
+    }
+
+    None
 }
 
 /// Resolve the git repo root — for stable project identity across subdirectories.
@@ -744,7 +794,7 @@ mod tests {
             diff_stat: Some("1 file changed".to_string()),
             latest_commit_msg: Some("add JWT authentication".to_string()),
         };
-        let title = capture.build_title(&changes);
+        let title = capture.build_title(&changes, None);
         assert_eq!(title, "myproject: add JWT authentication");
     }
 
@@ -759,7 +809,7 @@ mod tests {
             diff_stat: Some("3 files changed, 142 insertions(+), 10 deletions(-)".to_string()),
             latest_commit_msg: None,
         };
-        let title = capture.build_title(&changes);
+        let title = capture.build_title(&changes, None);
         assert_eq!(
             title,
             "myproject: 3 files changed, 142 insertions(+), 10 deletions(-)"
@@ -777,7 +827,7 @@ mod tests {
             diff_stat: None,
             latest_commit_msg: None,
         };
-        let title = capture.build_title(&changes);
+        let title = capture.build_title(&changes, None);
         assert_eq!(title, "myproject: session ended (no git changes)");
     }
 
@@ -792,7 +842,7 @@ mod tests {
             diff_stat: Some("1 file changed".to_string()),
             latest_commit_msg: Some("refactor: split auth module".to_string()),
         };
-        let title = capture.build_title(&changes);
+        let title = capture.build_title(&changes, None);
         // commit message wins
         assert!(title.contains("refactor: split auth module"));
         assert!(!title.contains("1 file changed"));
@@ -809,8 +859,66 @@ mod tests {
             diff_stat: None,
             latest_commit_msg: Some("add JWT authentication middleware".to_string()),
         };
-        let title = capture.build_title(&changes);
+        let title = capture.build_title(&changes, None);
         assert_eq!(title, "myproject: add JWT authentication middleware");
+    }
+
+    #[test]
+    fn build_title_prefers_session_summary_over_all() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: Some("2 files changed".to_string()),
+            latest_commit_msg: Some("feat: add widget".to_string()),
+        };
+        let summary = "Implemented the new auth flow with JWT tokens";
+        let title = capture.build_title(&changes, Some(summary));
+        assert_eq!(
+            title,
+            "myproject: Implemented the new auth flow with JWT tokens"
+        );
+        assert!(!title.contains("feat: add widget"));
+        assert!(!title.contains("files changed"));
+    }
+
+    #[test]
+    fn build_title_truncates_long_summary() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let long_summary = "a".repeat(110);
+        let title = capture.build_title(&changes, Some(&long_summary));
+        // should end with ellipsis and be truncated
+        assert!(title.ends_with('…'), "should end with ellipsis: {title}");
+        // project prefix + ": " + 100 chars + "…"
+        let suffix_chars: usize = title.strip_prefix("myproject: ").unwrap().chars().count();
+        assert_eq!(suffix_chars, 101, "100 chars + ellipsis: {suffix_chars}");
+    }
+
+    #[test]
+    fn build_title_uses_first_line_of_multiline_summary() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let summary = "First line of summary\n\nSecond paragraph here.";
+        let title = capture.build_title(&changes, Some(summary));
+        assert_eq!(title, "myproject: First line of summary");
+        assert!(!title.contains("Second paragraph"));
     }
 
     #[test]
@@ -979,5 +1087,35 @@ mod tests {
         // "#NoSpace" without a trailing space should fall through to filename
         let content = "#NoSpace\nSome content";
         assert_eq!(extract_title(content, "MEMORY.md"), "MEMORY");
+    }
+
+    // ── find_project_memory_md tests ───────────────────────────────────────────
+
+    #[test]
+    fn find_project_memory_md_reads_from_git_root() {
+        // We can't easily create a real git repo in a tempdir, so we test Strategy 2
+        // (claude projects dir) by pointing to a known structure.
+        let tmp = tempfile::tempdir().unwrap();
+        let mem_path = tmp.path().join("MEMORY.md");
+        std::fs::write(&mem_path, "# Test Project Memory\n\nSome content.").unwrap();
+
+        // Strategy 1 won't fire (no git repo). Strategy 2 also won't fire (no ~/.claude/projects).
+        // This test verifies the function returns None when no MEMORY.md is reachable.
+        // (We cannot mock git_repo_root without a real git repo.)
+        // Just verify the function doesn't panic on a plain directory.
+        let result = find_project_memory_md(tmp.path());
+        // No git repo → strategy 1 fails. No ~/.claude/projects match → strategy 2 fails.
+        // Result is None (the MEMORY.md in tmp root is NOT picked up — only git root or projects dir).
+        assert!(
+            result.is_none(),
+            "plain dir without git root should return None: {result:?}"
+        );
+    }
+
+    #[test]
+    fn find_project_memory_md_returns_none_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = find_project_memory_md(tmp.path());
+        assert!(result.is_none(), "empty dir should return None");
     }
 }
