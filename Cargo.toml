@@ -31,15 +31,14 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# TUI (week 2)
-ratatui = "0.30"
-crossterm = "0.29"
-
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = "z"
