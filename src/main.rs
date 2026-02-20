@@ -172,7 +172,9 @@ fn wire_claude_md(path: &Path) -> Result<bool> {
         format!("{existing}\n\n{CLAUDE_MD_BLOCK}")
     };
 
-    std::fs::write(path, new_content).with_context(|| format!("write {}", path.display()))?;
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, &new_content).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(true)
 }
 
@@ -328,26 +330,21 @@ fn cmd_index() -> Result<()> {
 
     save_index(&existing)?;
 
+    println!(
+        "Indexed: {} new, {} updated, {} unchanged, {} pruned{} ({} total)",
+        new_count,
+        updated_count,
+        unchanged_count,
+        pruned,
+        if error_count > 0 {
+            format!(", {} errors", error_count)
+        } else {
+            String::new()
+        },
+        existing.len()
+    );
     if error_count > 0 {
-        println!(
-            "Indexed: {} new, {} updated, {} unchanged, {} pruned, {} errors ({} total)",
-            new_count,
-            updated_count,
-            unchanged_count,
-            pruned,
-            error_count,
-            existing.len()
-        );
-        std::process::exit(1);
-    } else {
-        println!(
-            "Indexed: {} new, {} updated, {} unchanged, {} pruned ({} total)",
-            new_count,
-            updated_count,
-            unchanged_count,
-            pruned,
-            existing.len()
-        );
+        anyhow::bail!("{error_count} file(s) could not be read");
     }
     Ok(())
 }
@@ -425,7 +422,10 @@ fn save_index(entries: &[IndexEntry]) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string(entries)?)
         .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename to {}", path.display()));
+    }
     Ok(())
 }
 
@@ -469,7 +469,13 @@ fn find_memory_md(cwd: &Path) -> Option<(String, PathBuf)> {
     }
     // Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
     let projects = dirs::home_dir()?.join(".claude").join("projects");
-    let canonical = std::fs::canonicalize(cwd).ok()?;
+    let canonical = match std::fs::canonicalize(cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("mem: cannot canonicalize {}: {e}", cwd.display());
+            return None;
+        }
+    };
     let encoded = "-".to_string()
         + &canonical
             .to_string_lossy()
@@ -512,17 +518,22 @@ fn file_mtime(path: &Path) -> i64 {
 }
 
 fn hook_command_exists(entry: &serde_json::Value, cmd: &str) -> bool {
-    entry.as_array().is_some_and(|arr| {
-        arr.iter().any(|item| {
+    session_start_commands(entry).any(|c| c == cmd)
+}
+
+/// Iterator over every `command` string inside a SessionStart hook array.
+fn session_start_commands<'a>(entry: &'a serde_json::Value) -> impl Iterator<Item = &'a str> + 'a {
+    entry
+        .as_array()
+        .into_iter()
+        .flat_map(|arr| arr.iter())
+        .flat_map(|item| {
             item.get("hooks")
                 .and_then(|h| h.as_array())
-                .is_some_and(|hooks| {
-                    hooks
-                        .iter()
-                        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(cmd))
-                })
+                .into_iter()
+                .flat_map(|hooks| hooks.iter())
         })
-    })
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
 }
 
 fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
@@ -540,23 +551,13 @@ fn check_session_start_hook(settings_path: &Path) -> &'static str {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return "malformed settings.json";
     };
-    let has_hook = val
+    let entry = val
         .get("hooks")
         .and_then(|h| h.get("SessionStart"))
-        .and_then(|s| s.as_array())
-        .is_some_and(|arr| {
-            arr.iter().any(|item| {
-                item.get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.ends_with(" session-start"))
-                        })
-                    })
-            })
-        });
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    // Accept any command ending with " session-start" to handle path changes after reinstall.
+    let has_hook = session_start_commands(&entry).any(|c| c.ends_with(" session-start"));
     if has_hook {
         "installed"
     } else {
@@ -688,6 +689,27 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].project, "myapp");
         assert_eq!(loaded[0].content, "- Used JWT for auth");
+    }
+
+    #[test]
+    fn resolve_cwd_uses_project_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_cwd(Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    #[test]
+    fn hook_stdin_parses_cwd_field() {
+        let json = r#"{"cwd":"/tmp/myproject","sessionId":"abc"}"#;
+        let parsed: HookStdin = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.cwd.as_deref(), Some("/tmp/myproject"));
+    }
+
+    #[test]
+    fn hook_stdin_missing_cwd_is_none() {
+        let json = r#"{"sessionId":"abc"}"#;
+        let parsed: HookStdin = serde_json::from_str(json).unwrap();
+        assert!(parsed.cwd.is_none());
     }
 
     #[test]
