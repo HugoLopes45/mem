@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::db::Db;
 use crate::types::{HookStdin, Memory, MemoryType, TranscriptAnalytics};
@@ -97,11 +97,17 @@ impl AutoCapture {
     /// Gather committed work and diff stat since origin/HEAD.
     /// Falls back to `git diff --stat HEAD` when no remote is available.
     fn git_changes(&self) -> GitChanges {
-        let dir = self.project.to_string_lossy();
+        // Use .arg(&self.project) directly (OsStr) — avoids lossy UTF-8 conversion
+        // for paths that may contain non-UTF-8 bytes on some filesystems.
+        // stdin(Stdio::null()) prevents git from blocking on a terminal prompt
+        // (e.g. SSH passphrase or credential helper) when run in a hook context.
 
         // Try: git log --oneline origin/HEAD..HEAD
         let log_result = Command::new("git")
-            .args(["-C", &dir, "log", "--oneline", "origin/HEAD..HEAD"])
+            .arg("-C")
+            .arg(&self.project)
+            .args(["log", "--oneline", "origin/HEAD..HEAD"])
+            .stdin(Stdio::null())
             .output();
 
         let log_out = match log_result {
@@ -133,7 +139,10 @@ impl AutoCapture {
                     // Get diff stat vs origin.
                     // .ok() is safe here: git exists (the log command above succeeded).
                     let diff_stat = Command::new("git")
-                        .args(["-C", &dir, "diff", "origin/HEAD", "HEAD", "--stat"])
+                        .arg("-C")
+                        .arg(&self.project)
+                        .args(["diff", "origin/HEAD", "HEAD", "--stat"])
+                        .stdin(Stdio::null())
                         .output()
                         .ok()
                         .and_then(|o| {
@@ -163,7 +172,10 @@ impl AutoCapture {
         // .ok() is safe here: git exists (the log command above succeeded or exited non-zero,
         // neither of which is a NotFound error).
         let diff_stat = Command::new("git")
-            .args(["-C", &dir, "diff", "--stat", "HEAD"])
+            .arg("-C")
+            .arg(&self.project)
+            .args(["diff", "--stat", "HEAD"])
+            .stdin(Stdio::null())
             .output()
             .ok()
             .and_then(|o| {
@@ -229,14 +241,13 @@ impl AutoCapture {
 
 /// Resolve the git repo root — for stable project identity across subdirectories.
 pub fn git_repo_root(path: &Path) -> Option<String> {
-    // `.ok()?` is intentional: not a git repo is an expected, non-error condition
+    // `.ok()?` is intentional: not a git repo is an expected, non-error condition.
+    // Use .arg(path) (OsStr) to avoid lossy UTF-8 conversion on non-UTF-8 paths.
     let output = Command::new("git")
-        .args([
-            "-C",
-            &path.to_string_lossy(),
-            "rev-parse",
-            "--show-toplevel",
-        ])
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
         .output()
         .ok()?;
 

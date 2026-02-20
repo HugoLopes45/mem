@@ -2,6 +2,8 @@
 # SessionStart hook — writes recent memories to .mem-context.md in project root.
 # Include via @.mem-context.md in your project CLAUDE.md.
 # Must always exit 0.
+#
+# Requires: mem binary, jq (optional — falls back to $(pwd) if absent)
 set -euo pipefail
 
 MEM_BIN="${MEM_BIN:-mem}"
@@ -9,7 +11,13 @@ MEM_LOG="${MEM_LOG:-}"
 
 # Read cwd from hook stdin JSON
 INPUT=$(cat)
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+
+if ! command -v jq &>/dev/null; then
+    [ -n "$MEM_LOG" ] && echo "[mem] warn: jq not found — using pwd as cwd" >> "$MEM_LOG"
+    CWD="$(pwd)"
+else
+    CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+fi
 
 if [ -z "$CWD" ]; then
     CWD="$(pwd)"

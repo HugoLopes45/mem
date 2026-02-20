@@ -40,27 +40,34 @@ enum Commands {
     /// Run as MCP server (stdio transport)
     Mcp,
 
-    /// Auto-capture session memory from hook stdin (Stop hook)
+    /// Save a memory manually (title, content, type)
     Save {
-        /// Read hook stdin and auto-capture (Stop hook mode)
-        #[arg(long)]
-        auto: bool,
-
-        /// Project path override
-        #[arg(long)]
-        project: Option<PathBuf>,
-
-        /// Save manually with title + content
+        /// Short title for this memory
         #[arg(long)]
         title: Option<String>,
 
-        /// Memory content (for manual save)
+        /// Memory content
         #[arg(long)]
         content: Option<String>,
 
         /// Memory type: manual | pattern | decision
         #[arg(long, default_value = "manual")]
         memory_type: String,
+
+        /// Project path override
+        #[arg(long)]
+        project: Option<PathBuf>,
+
+        /// Session ID to associate with this memory
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+
+    /// Capture session memory from Stop hook stdin (called automatically by hooks)
+    Auto {
+        /// Project path override
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
 
     /// Output recent memories for context injection
@@ -143,18 +150,13 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::run_mcp_server(db_path)),
         Commands::Save {
-            auto,
-            project,
             title,
             content,
             memory_type,
-        } => {
-            if auto {
-                cmd_save_auto(db_path, project)
-            } else {
-                cmd_save_manual(db_path, title, content, memory_type, project)
-            }
-        }
+            project,
+            session_id,
+        } => cmd_save_manual(db_path, title, content, memory_type, project, session_id),
+        Commands::Auto { project } => cmd_save_auto(db_path, project),
         Commands::Context {
             project,
             limit,
@@ -201,6 +203,7 @@ fn cmd_save_manual(
     content: Option<String>,
     memory_type: String,
     project: Option<PathBuf>,
+    session_id: Option<String>,
 ) -> Result<()> {
     let title = title.context("--title required for manual save")?;
     let content = content.context("--content required for manual save")?;
@@ -213,7 +216,14 @@ fn cmd_save_manual(
         .and_then(|p| auto::git_repo_root(p).or_else(|| p.to_str().map(String::from)));
 
     let db = Db::open(&db_path)?;
-    let mem = db.save_memory(&title, mt, &content, project_str.as_deref(), None, None)?;
+    let mem = db.save_memory(
+        &title,
+        mt,
+        &content,
+        project_str.as_deref(),
+        session_id.as_deref(),
+        None,
+    )?;
     println!("Saved: {} (id: {})", mem.title, mem.id);
     Ok(())
 }
@@ -463,10 +473,11 @@ fn format_tokens(n: i64) -> String {
 fn format_duration(secs: i64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
-    if h > 0 {
-        format!("{h}h {m:02}m")
-    } else {
-        format!("{m}m")
+    let s = secs % 60;
+    match (h, m) {
+        (h, _) if h > 0 => format!("{h}h {m:02}m"),
+        (_, m) if m > 0 => format!("{m}m {s:02}s"),
+        _ => format!("{s}s"),
     }
 }
 

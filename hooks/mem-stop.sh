@@ -9,7 +9,7 @@ MEM_LOG="${MEM_LOG:-}"  # set to a file path to enable debug logging
 
 # Note: do NOT use `exec` here — it replaces the shell, making `|| true` dead code
 # if the binary is missing. Call the binary directly so the fallback applies.
-"$MEM_BIN" save --auto 2>/dev/null || {
-    [ -n "$MEM_LOG" ] && echo "[mem] warn: save --auto failed (exit $?)" >> "$MEM_LOG"
+"$MEM_BIN" auto 2>/dev/null || {
+    [ -n "$MEM_LOG" ] && echo "[mem] warn: auto failed (exit $?)" >> "$MEM_LOG"
     true
 }
