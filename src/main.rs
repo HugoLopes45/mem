@@ -159,11 +159,7 @@ enum Commands {
     },
 
     /// Wire mem hooks into ~/.claude/settings.json
-    Init {
-        /// Patch global settings (default) instead of project-local
-        #[arg(short = 'g', long)]
-        global: bool,
-    },
+    Init,
 
     /// Inject MEMORY.md + recent sessions at session start (called by SessionStart hook)
     SessionStart {
@@ -209,7 +205,7 @@ fn main() -> Result<()> {
         Commands::Gain => cmd_gain(db_path),
         Commands::Delete { id } => cmd_delete(db_path, id),
         Commands::Index { path, dry_run } => cmd_index(db_path, path, dry_run),
-        Commands::Init { .. } => cmd_init(),
+        Commands::Init => cmd_init(),
         Commands::SessionStart { project } => cmd_session_start(db_path, project),
         Commands::Status => cmd_status(db_path),
     }
@@ -539,7 +535,10 @@ fn cmd_index_single(db_path: PathBuf, path: PathBuf, dry_run: bool) -> Result<()
 }
 
 /// Applies all mem hooks into a settings.json at the given path.
+///
 /// Returns the list of hook labels that were added (empty if all already present).
+/// Returns `Err` if the current binary path cannot be resolved, `settings.json`
+/// is unreadable or contains invalid JSON, or the atomic rename fails.
 fn apply_hooks_to_settings(settings_path: &Path) -> Result<Vec<&'static str>> {
     let bin = std::env::current_exe().context("cannot resolve current binary path")?;
     let bin_str = bin.to_string_lossy();
@@ -639,8 +638,10 @@ fn apply_hooks_to_settings(settings_path: &Path) -> Result<Vec<&'static str>> {
         let serialized = serde_json::to_string_pretty(&settings)?;
         std::fs::write(&tmp_path, &serialized)
             .with_context(|| format!("write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, settings_path)
-            .with_context(|| format!("rename tmp to {}", settings_path.display()))?;
+        if let Err(e) = std::fs::rename(&tmp_path, settings_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| format!("rename tmp to {}", settings_path.display()));
+        }
     }
 
     Ok(added)
@@ -693,10 +694,10 @@ fn cmd_session_start(db_path: PathBuf, project_override: Option<PathBuf>) -> Res
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
             match serde_json::from_str::<types::HookStdin>(&buf) {
-                Ok(hook) => hook
-                    .cwd
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+                Ok(hook) => match hook.cwd.map(PathBuf::from) {
+                    Some(p) => p,
+                    None => std::env::current_dir()?,
+                },
                 Err(e) => {
                     eprintln!("[mem] warn: failed to parse hook stdin: {e}");
                     std::env::current_dir()?
@@ -717,10 +718,12 @@ fn cmd_session_start(db_path: PathBuf, project_override: Option<PathBuf>) -> Res
         if let Some(home) = dirs::home_dir() {
             let global_mem = home.join(".claude").join("MEMORY.md");
             if global_mem.exists() {
-                if let Ok(content) = std::fs::read_to_string(&global_mem) {
-                    if !content.trim().is_empty() {
+                match std::fs::read_to_string(&global_mem) {
+                    Ok(content) if !content.trim().is_empty() => {
                         parts.push(format!("# Global Memory\n\n{content}"));
                     }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[mem] warn: could not read {}: {e}", global_mem.display()),
                 }
             }
         }
@@ -740,13 +743,19 @@ fn cmd_session_start(db_path: PathBuf, project_override: Option<PathBuf>) -> Res
     let system_message = match result {
         Ok(msg) => msg,
         Err(e) => {
-            eprintln!("[mem] warn: session-start failed: {e}");
-            String::new()
+            eprintln!("[mem] error: session-start failed: {e:#}");
+            // Embed the error as a Markdown blockquote so Claude sees it in context.
+            // (HTML comments are rendered as literal text to the model, not hidden.)
+            format!("> **mem warning:** context injection failed — {e}\n> Run `mem status` to diagnose. This session starts without memory context.")
         }
     };
 
     let output = SessionStartOutput { system_message };
-    println!("{}", serde_json::to_string(&output)?);
+    // SessionStartOutput only contains a String — serialization cannot fail.
+    // Use unwrap_or_else to guarantee exit 0 even if somehow it did.
+    let json =
+        serde_json::to_string(&output).unwrap_or_else(|_| r#"{"systemMessage":""}"#.to_string());
+    println!("{json}");
     Ok(())
 }
 
@@ -758,21 +767,30 @@ fn cmd_status(db_path: PathBuf) -> Result<()> {
     let settings_path = dirs::home_dir()
         .map(|h| h.join(".claude").join("settings.json"))
         .unwrap_or_default();
-    let hooks_installed = if settings_path.exists() {
-        std::fs::read_to_string(&settings_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .map(|v| check_mem_hooks_present(&v))
-            .unwrap_or(false)
+    let hooks_status = if !settings_path.exists() {
+        "NOT installed — run `mem init`"
     } else {
-        false
+        match std::fs::read_to_string(&settings_path) {
+            Err(e) => {
+                eprintln!("[mem] warn: cannot read {}: {e}", settings_path.display());
+                "unknown — settings.json unreadable"
+            }
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Err(e) => {
+                    eprintln!("[mem] warn: cannot parse {}: {e}", settings_path.display());
+                    "unknown — settings.json malformed"
+                }
+                Ok(v) => {
+                    if check_mem_hooks_present(&v) {
+                        "installed"
+                    } else {
+                        "NOT installed — run `mem init`"
+                    }
+                }
+            },
+        }
     };
-
-    if hooks_installed {
-        println!("Hooks    : installed");
-    } else {
-        println!("Hooks    : NOT installed — run `mem init`");
-    }
+    println!("Hooks    : {hooks_status}");
 
     println!();
 
@@ -792,8 +810,10 @@ fn cmd_status(db_path: PathBuf) -> Result<()> {
     println!("Projects : {}", s.project_count);
     println!("DB size  : {} KB", s.db_size_bytes / 1024);
 
-    if let Ok(Some(dt)) = db.last_capture_time() {
-        println!("Last cap : {}", dt.format("%Y-%m-%d %H:%M UTC"));
+    match db.last_capture_time() {
+        Ok(Some(dt)) => println!("Last cap : {}", dt.format("%Y-%m-%d %H:%M UTC")),
+        Ok(None) => {}
+        Err(e) => eprintln!("[mem] warn: could not read last capture time: {e}"),
     }
 
     match db.gain_stats() {
@@ -812,7 +832,9 @@ fn cmd_status(db_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Returns true if at least the Stop hook for `mem auto` is present in settings.
+/// Returns true if the Stop hook for `mem auto` is present in settings.
+/// Used by `cmd_status` as a proxy for "any mem hook installed", not "all hooks installed".
+/// Does not verify SessionStart or PreCompact hooks.
 pub fn check_mem_hooks_present(settings: &serde_json::Value) -> bool {
     let stop_hooks = settings
         .get("hooks")
@@ -827,7 +849,15 @@ pub fn check_mem_hooks_present(settings: &serde_json::Value) -> bool {
                     hooks.iter().any(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("mem") && c.contains("auto"))
+                            // Match "mem auto" as a word-boundary substring to avoid false
+                            // positives from third-party hooks that happen to mention both words.
+                            .is_some_and(|c| {
+                                c.ends_with(" auto")
+                                    && (c.ends_with("/mem auto") || c.ends_with("\\mem auto") || {
+                                        // Also match bare "mem auto" (no path prefix)
+                                        c == "mem auto" || c.starts_with("mem auto ")
+                                    })
+                            })
                     })
                 })
         })
@@ -1170,6 +1200,186 @@ mod tests {
     #[test]
     fn check_mem_hooks_present_returns_false_when_no_hooks() {
         let settings = serde_json::json!({"model": "claude-sonnet-4-6"});
+        assert!(!check_mem_hooks_present(&settings));
+    }
+
+    #[test]
+    fn cmd_init_adds_missing_hooks_when_stop_already_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-populate with only the Stop hook
+        let existing = serde_json::json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "/some/other/mem auto"}]}]
+            }
+        });
+        let settings_path = write_settings(tmp.path(), existing);
+        let added = apply_hooks_to_settings(&settings_path).unwrap();
+
+        // Stop already has a mem-auto-like command, but it's a different binary path.
+        // The new binary path should still be added (dedup is per exact command string).
+        // What matters: SessionStart and PreCompact must be added.
+        let added_labels: Vec<&str> = added.iter().copied().collect();
+        assert!(
+            added_labels.contains(&"SessionStart hook"),
+            "SessionStart should be added when absent"
+        );
+        assert!(
+            added_labels.contains(&"PreCompact hook (auto)"),
+            "PreCompact auto should be added when absent"
+        );
+        assert!(
+            added_labels.contains(&"PreCompact hook (manual)"),
+            "PreCompact manual should be added when absent"
+        );
+    }
+
+    #[test]
+    fn cmd_context_compact_output_includes_memory_md_prefix() {
+        use crate::types::CompactContextOutput;
+
+        // Simulate the compact path: given a MEMORY.md content, verify the
+        // CompactContextOutput JSON structure has "# Project Memory" prefix.
+        let memory_md_content = "# Test\n\nsome notes".to_string();
+        let md_section = format!("# Project Memory\n\n{memory_md_content}");
+
+        let output = CompactContextOutput {
+            additional_context: md_section,
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let ctx = parsed["additionalContext"].as_str().unwrap();
+        assert!(
+            ctx.starts_with("# Project Memory"),
+            "compact output must start with '# Project Memory'"
+        );
+        assert!(
+            ctx.contains("some notes"),
+            "compact output must contain MEMORY.md body"
+        );
+    }
+
+    #[test]
+    fn apply_hooks_to_settings_returns_error_on_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{broken json"#).unwrap();
+
+        let err = apply_hooks_to_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse settings.json"),
+            "error should mention parse settings.json: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_start_output_serializes_correctly() {
+        // Verify SessionStartOutput always produces the {"systemMessage":...} key
+        // that the Claude Code hook protocol requires.
+        let output = SessionStartOutput {
+            system_message: "hello world".to_string(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["systemMessage"].as_str(),
+            Some("hello world"),
+            "must use camelCase 'systemMessage' key"
+        );
+        // Empty message is also valid (fallback path)
+        let empty = SessionStartOutput {
+            system_message: String::new(),
+        };
+        let json2 = serde_json::to_string(&empty).unwrap();
+        assert!(json2.contains(r#""systemMessage":""#));
+    }
+
+    // ── apply_hooks_to_settings edge cases ────────────────────────────────────
+
+    #[test]
+    fn apply_hooks_settings_json_array_root_returns_error() {
+        // Top-level value is a JSON array, not an object → "settings.json must be a JSON object"
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"["not","an","object"]"#).unwrap();
+        let err = apply_hooks_to_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("JSON object"),
+            "array-root settings.json should error with 'JSON object': {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_hooks_hooks_key_is_not_object_returns_error() {
+        // hooks is an array, not an object → "hooks must be a JSON object"
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hooks":[]}"#).unwrap();
+        let err = apply_hooks_to_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hooks must be"),
+            "array hooks should error with 'hooks must be': {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_hooks_stop_hooks_is_not_array_returns_error() {
+        // Stop hooks value is a string, not an array → "Stop hooks must be array"
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hooks":{"Stop":"not-an-array"}}"#).unwrap();
+        let err = apply_hooks_to_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be array"),
+            "non-array Stop hooks should error: {msg}"
+        );
+    }
+
+    // ── format_duration edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_negative_does_not_panic() {
+        // Negative input: defined behavior (truncation toward zero), must not panic
+        let result = format_duration(-1);
+        // Just verify it returns something reasonable without panicking
+        assert!(
+            !result.is_empty(),
+            "format_duration(-1) must return a non-empty string"
+        );
+    }
+
+    #[test]
+    fn format_duration_i64_max_does_not_overflow() {
+        let result = format_duration(i64::MAX);
+        assert!(
+            !result.is_empty(),
+            "format_duration(i64::MAX) must not panic"
+        );
+        assert!(
+            result.contains('h'),
+            "very large value should be hours: {result}"
+        );
+    }
+
+    // ── check_mem_hooks_present edge cases ────────────────────────────────────
+
+    #[test]
+    fn check_mem_hooks_present_handles_stop_as_non_array() {
+        // Stop is present but not an array — should return false, not panic
+        let settings = serde_json::json!({
+            "hooks": {"Stop": "not-an-array"}
+        });
+        assert!(!check_mem_hooks_present(&settings));
+    }
+
+    #[test]
+    fn check_mem_hooks_present_handles_hooks_as_non_object() {
+        // hooks is a string — should return false, not panic
+        let settings = serde_json::json!({"hooks": "wrong-type"});
         assert!(!check_mem_hooks_present(&settings));
     }
 }

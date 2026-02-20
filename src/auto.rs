@@ -71,21 +71,43 @@ impl AutoCapture {
 
         // Parse transcript BEFORE building title so session_summary is available.
         let mut session_summary: Option<String> = None;
-        if let Some(ref sid) = self.session_id {
-            if let Err(e) = db.end_session(sid) {
-                eprintln!("[mem] warn: end_session failed for {sid}: {e}");
-            }
-
-            // Parse transcript analytics if available — non-fatal
-            if let Some(ref tp) = self.transcript_path {
-                if let Some(analytics) = parse_transcript(tp) {
-                    session_summary = analytics.last_assistant_message.clone();
-                    if let Err(e) = db.update_session_analytics(sid, &analytics) {
-                        eprintln!("[mem] warn: update_session_analytics failed for {sid}: {e}");
+        // If start_session fails we must not pass the session_id to save_memory — doing so
+        // would guarantee a FOREIGN KEY constraint violation. Fall back to None so the memory
+        // is saved without a session reference rather than failing entirely.
+        let effective_session_id: Option<String> = if let Some(ref sid) = self.session_id {
+            // Ensure the session row exists before save_memory references it via FK.
+            // start_session uses INSERT OR IGNORE, so this is safe to call even if the
+            // SessionStart hook already registered it.
+            match db.start_session(sid, Some(&project_str), None) {
+                Ok(_) => {
+                    if let Err(e) = db.end_session(sid) {
+                        eprintln!("[mem] warn: end_session failed for {sid}: {e}");
                     }
+
+                    // Parse transcript analytics if available — non-fatal
+                    if let Some(ref tp) = self.transcript_path {
+                        if let Some(analytics) = parse_transcript(tp) {
+                            session_summary = analytics.last_assistant_message.clone();
+                            if let Err(e) = db.update_session_analytics(sid, &analytics) {
+                                eprintln!(
+                                    "[mem] warn: update_session_analytics failed for {sid}: {e}"
+                                );
+                            }
+                        }
+                    }
+
+                    Some(sid.clone())
+                }
+                Err(e) => {
+                    eprintln!(
+                            "[mem] warn: start_session failed for {sid}: {e} — saving memory without session link"
+                        );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         let title = self.build_title(&changes, session_summary.as_deref());
         let content = self.build_content(&diff_text, session_summary.as_deref());
@@ -95,7 +117,7 @@ impl AutoCapture {
             MemoryType::Auto,
             &content,
             Some(&project_str),
-            self.session_id.as_deref(),
+            effective_session_id.as_deref(),
             diff_text.as_deref(),
         )
     }
@@ -119,7 +141,10 @@ impl AutoCapture {
                     latest_commit_msg: None,
                 };
             }
-            Err(_) => None,
+            Err(e) => {
+                eprintln!("[mem] warn: failed to spawn git: {e}");
+                None
+            }
             Ok(out) => Some(out),
         };
 
@@ -220,9 +245,17 @@ impl AutoCapture {
             }
         }
 
-        // Priority 2: Prefer the most recent commit message
+        // Priority 2: Prefer the most recent commit message, truncated to 100 chars
         if let Some(ref msg) = changes.latest_commit_msg {
-            return format!("{project_name}: {msg}");
+            let first_line = msg.lines().next().unwrap_or(msg).trim();
+            return if first_line.chars().count() > 100 {
+                format!(
+                    "{project_name}: {}…",
+                    first_line.chars().take(100).collect::<String>()
+                )
+            } else {
+                format!("{project_name}: {first_line}")
+            };
         }
 
         // Priority 3: Fall back to diff stat summary line
@@ -262,23 +295,32 @@ impl AutoCapture {
 /// Find the MEMORY.md file for the given working directory.
 ///
 /// Strategy 1: git repo root + "/MEMORY.md"
-/// Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
+/// Strategy 2: `~/.claude/projects/<encoded>/memory/MEMORY.md`
+///   where `<encoded>` is `-` + canonical cwd stripped of leading `/` with `/` replaced by `-`.
+///   Example: `/Users/hugo/projects/mem` → `-Users-hugo-projects-mem`
 ///
-/// Returns `(content, path)` or `None` if not found.
+/// Returns `(content, path)` or `None` if not found. Logs warnings on I/O failures.
 pub fn find_project_memory_md(cwd: &Path) -> Option<(String, PathBuf)> {
     // Strategy 1: git root MEMORY.md
     if let Some(root) = git_repo_root(cwd) {
         let path = PathBuf::from(&root).join("MEMORY.md");
         if path.exists() {
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                return Some((c, path));
+            match std::fs::read_to_string(&path) {
+                Ok(c) => return Some((c, path)),
+                Err(e) => eprintln!("[mem] warn: could not read {}: {e}", path.display()),
             }
         }
     }
 
     // Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
     let projects = dirs::home_dir()?.join(".claude").join("projects");
-    let canonical = std::fs::canonicalize(cwd).ok()?;
+    let canonical = match std::fs::canonicalize(cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[mem] warn: could not canonicalize {}: {e}", cwd.display());
+            return None;
+        }
+    };
     let encoded = "-".to_string()
         + &canonical
             .to_string_lossy()
@@ -286,8 +328,9 @@ pub fn find_project_memory_md(cwd: &Path) -> Option<(String, PathBuf)> {
             .replace('/', "-");
     let path = projects.join(encoded).join("memory").join("MEMORY.md");
     if path.exists() {
-        if let Ok(c) = std::fs::read_to_string(&path) {
-            return Some((c, path));
+        match std::fs::read_to_string(&path) {
+            Ok(c) => return Some((c, path)),
+            Err(e) => eprintln!("[mem] warn: could not read {}: {e}", path.display()),
         }
     }
 
@@ -638,7 +681,10 @@ pub fn scan_and_index_memory_files_in(
                 mtime,
             ) {
                 Ok(outcome) => IndexEntryStatus::from(outcome),
-                Err(_) => IndexEntryStatus::New, // conservative fallback
+                Err(e) => {
+                    eprintln!("[mem] warn: dry-run DB query failed for {source_path}: {e}");
+                    IndexEntryStatus::New // conservative fallback: assume new if unknown
+                }
             }
         } else {
             let outcome: UpsertOutcome = db.upsert_indexed_file(
@@ -900,7 +946,11 @@ mod tests {
         // should end with ellipsis and be truncated
         assert!(title.ends_with('…'), "should end with ellipsis: {title}");
         // project prefix + ": " + 100 chars + "…"
-        let suffix_chars: usize = title.strip_prefix("myproject: ").unwrap().chars().count();
+        let suffix_chars: usize = title
+            .strip_prefix("myproject: ")
+            .expect("title must start with 'myproject: '")
+            .chars()
+            .count();
         assert_eq!(suffix_chars, 101, "100 chars + ellipsis: {suffix_chars}");
     }
 
@@ -1117,5 +1167,278 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = find_project_memory_md(tmp.path());
         assert!(result.is_none(), "empty dir should return None");
+    }
+
+    #[test]
+    fn build_title_exactly_100_chars_not_truncated() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let summary = "a".repeat(100);
+        let title = capture.build_title(&changes, Some(&summary));
+        assert!(
+            !title.ends_with('…'),
+            "exactly 100 chars should NOT be truncated: {title}"
+        );
+        assert!(
+            title.ends_with(&summary),
+            "full 100-char summary should appear verbatim: {title}"
+        );
+    }
+
+    #[test]
+    fn build_title_101_chars_is_truncated() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let summary = "a".repeat(101);
+        let title = capture.build_title(&changes, Some(&summary));
+        assert!(
+            title.ends_with('…'),
+            "101 chars should be truncated with ellipsis: {title}"
+        );
+        let suffix_chars = title
+            .strip_prefix("myproject: ")
+            .expect("title must start with 'myproject: '")
+            .chars()
+            .count();
+        assert_eq!(
+            suffix_chars, 101,
+            "100 data chars + ellipsis = 101: {suffix_chars}"
+        );
+    }
+
+    // ── build_title edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn build_title_whitespace_only_summary_falls_through_to_commit() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: Some("fix the bug".to_string()),
+        };
+        // A summary whose first line is blank after trim must not produce "myproject:   "
+        let title = capture.build_title(&changes, Some("   \n\nReal content"));
+        assert_eq!(
+            title, "myproject: fix the bug",
+            "whitespace first line should fall through to commit msg: {title}"
+        );
+    }
+
+    #[test]
+    fn build_title_project_root_slash_uses_unknown_fallback() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let title = capture.build_title(&changes, None);
+        assert!(
+            title.starts_with("unknown"),
+            "root '/' project should fall back to 'unknown': {title}"
+        );
+    }
+
+    #[test]
+    fn build_title_100_char_summary_with_subsequent_lines_no_truncation() {
+        let capture = AutoCapture {
+            project: PathBuf::from("/tmp/myproject"),
+            session_id: None,
+            transcript_path: None,
+        };
+        let changes = GitChanges {
+            diff_stat: None,
+            latest_commit_msg: None,
+        };
+        let first_line = "a".repeat(100);
+        let summary = format!("{first_line}\n\nSecond paragraph ignored.");
+        let title = capture.build_title(&changes, Some(&summary));
+        assert!(
+            !title.ends_with('…'),
+            "100-char first line should not truncate: {title}"
+        );
+        assert!(
+            !title.contains("Second paragraph"),
+            "subsequent lines must be excluded: {title}"
+        );
+        assert!(
+            title.ends_with(&first_line),
+            "full first line must appear: {title}"
+        );
+    }
+
+    // ── extract_title edge cases ────────────────────────────────────────────────
+
+    #[test]
+    fn extract_title_hash_space_only_falls_through_to_filename() {
+        // "# " with nothing after the space is an empty title — should fall through
+        let content = "# \nSome body";
+        assert_eq!(extract_title(content, "MEMORY.md"), "MEMORY");
+    }
+
+    #[test]
+    fn extract_title_empty_content_returns_filename_stem() {
+        assert_eq!(extract_title("", "MEMORY.md"), "MEMORY");
+        assert_eq!(extract_title("", "project.md"), "project");
+    }
+
+    #[test]
+    fn extract_title_h1_on_last_line_no_trailing_newline() {
+        let content = "Some body\n# Last Line Title";
+        assert_eq!(extract_title(content, "MEMORY.md"), "Last Line Title");
+    }
+
+    // ── from_stdin edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn from_stdin_empty_string_returns_some_with_cwd() {
+        // Empty string: JSON parse fails → HookStdin::default() → no cwd → current_dir()
+        let result = AutoCapture::from_stdin("", None).unwrap();
+        assert!(
+            result.is_some(),
+            "empty stdin should return Some (using cwd), not None"
+        );
+    }
+
+    #[test]
+    fn from_stdin_empty_object_returns_some() {
+        let result = AutoCapture::from_stdin("{}", None).unwrap();
+        assert!(result.is_some(), "empty JSON object should return Some");
+    }
+
+    #[test]
+    fn from_stdin_explicit_false_stop_hook_active_returns_some() {
+        let json = r#"{"cwd":"/tmp/proj","stop_hook_active":false}"#;
+        let result = AutoCapture::from_stdin(json, None).unwrap();
+        assert!(
+            result.is_some(),
+            "stop_hook_active=false must NOT short-circuit"
+        );
+    }
+
+    #[test]
+    fn from_stdin_override_project_wins_over_cwd_in_json() {
+        let json = r#"{"cwd":"/from-json"}"#;
+        let override_path = std::path::Path::new("/override");
+        let result = AutoCapture::from_stdin(json, Some(override_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.project,
+            PathBuf::from("/override"),
+            "override must win over cwd in JSON"
+        );
+    }
+
+    #[test]
+    fn from_stdin_stop_hook_active_true_returns_none() {
+        let json = r#"{"cwd":"/tmp","stop_hook_active":true}"#;
+        let result = AutoCapture::from_stdin(json, None).unwrap();
+        assert!(result.is_none(), "stop_hook_active=true must return None");
+    }
+
+    // ── parse_transcript edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_transcript_whitespace_only_lines_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        // A whitespace-only line between valid entries must not cause a JSON parse error log
+        let content = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            "\n   \n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+            "\n"
+        );
+        std::fs::write(&path, content).unwrap();
+        let result = parse_transcript(&path.to_string_lossy());
+        assert!(
+            result.is_some(),
+            "whitespace-only lines should be skipped, not cause parse failure"
+        );
+        let a = result.unwrap();
+        assert_eq!(a.last_assistant_message.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_transcript_assistant_with_multiple_text_blocks_joined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let content = r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"block one"},{"type":"text","text":"block two"}]},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        std::fs::write(&path, content).unwrap();
+        let result = parse_transcript(&path.to_string_lossy()).unwrap();
+        assert_eq!(
+            result.last_assistant_message.as_deref(),
+            Some("block one\n\nblock two"),
+            "multiple text blocks must be joined with \\n\\n"
+        );
+    }
+
+    #[test]
+    fn parse_transcript_only_user_turns_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let content = r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"just a user turn"}}"#;
+        std::fs::write(&path, content).unwrap();
+        let result = parse_transcript(&path.to_string_lossy());
+        assert!(result.is_none(), "no assistant turns → None");
+    }
+
+    #[test]
+    fn parse_transcript_assistant_empty_content_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        // An assistant turn with content=[] should not crash; last_assistant_message stays None
+        let content = r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[]},"usage":{"input_tokens":5,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        std::fs::write(&path, content).unwrap();
+        // turn_count > 0, so Some is returned but last_assistant_message is None
+        let result = parse_transcript(&path.to_string_lossy());
+        if let Some(a) = result {
+            assert!(
+                a.last_assistant_message.is_none(),
+                "empty content array → no last message"
+            );
+        }
+        // returning None is also acceptable (turn_count == 0 with empty content)
+    }
+
+    // ── scan_and_index edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn scan_nonexistent_dir_returns_empty_ok() {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        let result = scan_and_index_memory_files_in(
+            &db,
+            std::path::Path::new("/nonexistent/path/xyz"),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "nonexistent dir should return Ok (not Err): {result:?}"
+        );
+        let stats = result.unwrap();
+        assert_eq!(stats.new, 0);
+        assert_eq!(stats.updated, 0);
+        assert_eq!(stats.unchanged, 0);
     }
 }

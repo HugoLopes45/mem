@@ -1943,4 +1943,297 @@ mod tests {
             "last_capture_time should be within last minute, but age is {age}"
         );
     }
+
+    // ── last_capture_time ordering ────────────────────────────────────────────
+
+    #[test]
+    fn last_capture_time_returns_newer_not_older() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+
+        let m1 = db
+            .save_memory(
+                "older",
+                MemoryType::Auto,
+                "content A",
+                Some("/p"),
+                None,
+                None,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let m2 = db
+            .save_memory(
+                "newer",
+                MemoryType::Auto,
+                "content B",
+                Some("/p"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let dt = db
+            .last_capture_time()
+            .expect("last_capture_time DB call failed")
+            .expect("expected Some timestamp after two saves");
+        // Must equal m2's timestamp, not m1's
+        let diff = dt.signed_duration_since(m1.created_at).num_milliseconds();
+        assert!(
+            diff >= 0,
+            "last_capture_time must be >= older memory: diff={diff}ms"
+        );
+        let diff2 = m2
+            .created_at
+            .signed_duration_since(dt)
+            .num_milliseconds()
+            .abs();
+        assert!(
+            diff2 < 1000,
+            "last_capture_time must be close to newer memory: diff={diff2}ms"
+        );
+    }
+
+    // ── save_memory FK edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn save_memory_with_nonexistent_session_id_fails_fk() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        // No session row registered → FK violation expected
+        let result = db.save_memory(
+            "title",
+            MemoryType::Auto,
+            "content",
+            None,
+            Some("nonexistent-session-xyz"),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "FK violation expected when session_id not in sessions table"
+        );
+    }
+
+    #[test]
+    fn save_memory_session_id_works_after_start_session() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.start_session("sess-abc", Some("/proj"), None).unwrap();
+        let result = db.save_memory(
+            "title",
+            MemoryType::Auto,
+            "content",
+            Some("/proj"),
+            Some("sess-abc"),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "should succeed after start_session: {result:?}"
+        );
+    }
+
+    #[test]
+    fn start_session_is_idempotent_via_insert_or_ignore() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.start_session("s1", Some("/p"), None).unwrap();
+        // Second call must not error (INSERT OR IGNORE)
+        let result = db.start_session("s1", Some("/p"), None);
+        assert!(
+            result.is_ok(),
+            "start_session twice must be idempotent: {result:?}"
+        );
+    }
+
+    // ── search edge cases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn search_memories_empty_query_returns_ok() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        // Empty query is phrase-quoted to "\"\"" — must not panic
+        let result = db.search_memories("", None, 10);
+        assert!(result.is_ok(), "empty query must return Ok: {result:?}");
+    }
+
+    #[test]
+    fn search_memories_whitespace_only_query_returns_ok() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let result = db.search_memories("   ", None, 10);
+        assert!(
+            result.is_ok(),
+            "whitespace query must return Ok: {result:?}"
+        );
+    }
+
+    #[test]
+    fn search_memories_unicode_query_returns_ok() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory(
+            "Japanese title 日本語",
+            MemoryType::Manual,
+            "content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = db.search_memories("日本語", None, 10);
+        assert!(result.is_ok(), "unicode query must not error: {result:?}");
+    }
+
+    #[test]
+    fn search_unified_limit_zero_returns_empty() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory("title", MemoryType::Manual, "content", None, None, None)
+            .unwrap();
+        let result = db.search_unified("title", None, 0).unwrap();
+        assert!(result.is_empty(), "limit=0 must return empty vec");
+    }
+
+    #[test]
+    fn search_unified_limit_one_returns_exactly_one() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory(
+            "alpha content",
+            MemoryType::Manual,
+            "alpha content",
+            Some("/p"),
+            None,
+            None,
+        )
+        .unwrap();
+        db.save_memory(
+            "alpha content 2",
+            MemoryType::Manual,
+            "alpha content",
+            Some("/p"),
+            None,
+            None,
+        )
+        .unwrap();
+        let result = db.search_unified("alpha", None, 1).unwrap();
+        assert_eq!(result.len(), 1, "limit=1 must return exactly 1 result");
+    }
+
+    // ── save_memory content/title validation ─────────────────────────────────
+
+    #[test]
+    fn save_memory_large_content_roundtrips() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let big = "x".repeat(500_000);
+        let mem = db
+            .save_memory("large title", MemoryType::Manual, &big, None, None, None)
+            .unwrap();
+        let fetched = db
+            .get_memory(&mem.id)
+            .expect("get_memory DB call failed")
+            .expect("memory not found by ID — large content roundtrip failed");
+        assert_eq!(
+            fetched.content.len(),
+            500_000,
+            "large content must roundtrip exactly"
+        );
+    }
+
+    #[test]
+    fn save_memory_unicode_title_and_content_roundtrips() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = db
+            .save_memory(
+                "日本語タイトル 🦀",
+                MemoryType::Manual,
+                "emoji 🦀 content",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let fetched = db
+            .get_memory(&mem.id)
+            .expect("get_memory DB call failed")
+            .expect("memory not found by ID — unicode roundtrip failed");
+        assert_eq!(fetched.title, "日本語タイトル 🦀");
+        assert_eq!(fetched.content, "emoji 🦀 content");
+    }
+
+    // ── upsert_indexed_file edge cases ────────────────────────────────────────
+
+    #[test]
+    fn upsert_mtime_backwards_triggers_update() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 2000)
+            .unwrap();
+        // Clock skew: mtime goes back
+        let outcome = db
+            .upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::types::UpsertOutcome::Updated),
+            "mtime change (even backwards) must trigger Updated: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_same_mtime_returns_unchanged() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        let outcome = db
+            .upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::types::UpsertOutcome::Unchanged),
+            "identical mtime must return Unchanged: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_mtime_zero_same_twice_is_unchanged() {
+        // mtime=0 (stat failure fallback) must still deduplicate on second call
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 0)
+            .unwrap();
+        let outcome = db
+            .upsert_indexed_file("/p/MEMORY.md", None, "proj", "Title", "content", 0)
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::types::UpsertOutcome::Unchanged),
+            "mtime=0 twice must be Unchanged, not Updated: {outcome:?}"
+        );
+    }
+
+    // ── run_decay edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn run_decay_threshold_zero_marks_nothing_cold() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory("m1", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+        let count = db.run_decay(0.0, false).unwrap();
+        // Fresh memory has retention >= 1.0 >> 0.0, so nothing should decay
+        assert_eq!(count, 0, "threshold=0.0 should mark nothing cold");
+    }
+
+    #[test]
+    fn run_decay_threshold_infinity_marks_all_cold() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory("m1", MemoryType::Auto, "c1", None, None, None)
+            .unwrap();
+        db.save_memory("m2", MemoryType::Auto, "c2", None, None, None)
+            .unwrap();
+        let count = db.run_decay(f64::INFINITY, false).unwrap();
+        assert_eq!(count, 2, "threshold=∞ should mark all active memories cold");
+    }
+
+    #[test]
+    fn run_decay_threshold_nan_does_not_panic() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.save_memory("m1", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+        // NaN comparisons are always false in SQL → should mark nothing cold
+        let result = db.run_decay(f64::NAN, false);
+        assert!(result.is_ok(), "NaN threshold must not panic: {result:?}");
+    }
+
+    // ── apply_hooks_to_settings edge cases ───────────────────────────────────
+
+    // (These are in main.rs tests, kept here as a note — see main.rs for coverage)
 }
