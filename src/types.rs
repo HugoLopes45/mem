@@ -1,6 +1,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Typed parse error for memory type/status/scope string conversion.
+/// Provides descriptive messages without pulling in anyhow for this domain type.
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("unknown memory type: '{0}'. Valid values: manual, pattern, decision")]
+    Type(String),
+    #[error("unknown memory status: '{0}'")]
+    Status(String),
+    #[error("unknown memory scope: '{0}'")]
+    Scope(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
@@ -40,16 +52,14 @@ impl std::fmt::Display for MemoryType {
 }
 
 impl std::str::FromStr for MemoryType {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> anyhow::Result<Self> {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, ParseError> {
         match s {
             "auto" => Ok(MemoryType::Auto),
             "manual" => Ok(MemoryType::Manual),
             "pattern" => Ok(MemoryType::Pattern),
             "decision" => Ok(MemoryType::Decision),
-            other => Err(anyhow::anyhow!(
-                "unknown memory type: '{other}'. Valid values: manual, pattern, decision"
-            )),
+            other => Err(ParseError::Type(other.to_string())),
         }
     }
 }
@@ -92,12 +102,12 @@ impl std::fmt::Display for MemoryStatus {
 }
 
 impl std::str::FromStr for MemoryStatus {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> anyhow::Result<Self> {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, ParseError> {
         match s {
             "active" => Ok(MemoryStatus::Active),
             "cold" => Ok(MemoryStatus::Cold),
-            other => Err(anyhow::anyhow!("unknown memory status: '{other}'")),
+            other => Err(ParseError::Status(other.to_string())),
         }
     }
 }
@@ -119,12 +129,12 @@ impl std::fmt::Display for MemoryScope {
 }
 
 impl std::str::FromStr for MemoryScope {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> anyhow::Result<Self> {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, ParseError> {
         match s {
             "project" => Ok(MemoryScope::Project),
             "global" => Ok(MemoryScope::Global),
-            other => Err(anyhow::anyhow!("unknown memory scope: '{other}'")),
+            other => Err(ParseError::Scope(other.to_string())),
         }
     }
 }

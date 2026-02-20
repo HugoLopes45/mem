@@ -38,6 +38,8 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+# thiserror is already a transitive dep of rmcp — zero binary-size overhead
+thiserror = "1"
 dirs = "6"
 
 [dev-dependencies]

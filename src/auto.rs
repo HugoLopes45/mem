@@ -258,11 +258,23 @@ pub fn git_repo_root(path: &Path) -> Option<String> {
     }
 }
 
+/// Validate that a transcript path is safe to read: must be absolute and must not
+/// traverse via `..` components. This prevents hook-injected paths from escaping
+/// the user's filesystem context via path traversal.
+fn is_safe_transcript_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    p.is_absolute() && p.components().all(|c| c != std::path::Component::ParentDir)
+}
+
 /// Parse a JSONL transcript file and extract session analytics.
 ///
-/// Returns `None` if the file is unreadable or contains no assistant entries.
-/// Skips lines that fail JSON parsing without aborting.
+/// Returns `None` if the file is unreadable, fails path validation, or contains
+/// no assistant entries. Skips lines that fail JSON parsing without aborting.
 pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
+    if !is_safe_transcript_path(path) {
+        eprintln!("[mem] warn: transcript_path rejected (unsafe path): {path}");
+        return None;
+    }
     let content = std::fs::read_to_string(path)
         .map_err(|e| eprintln!("[mem] warn: could not read transcript {path}: {e}"))
         .ok()?;
