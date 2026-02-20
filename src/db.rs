@@ -12,6 +12,7 @@ use crate::types::{
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_decay_scope.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_session_analytics.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_indexes.sql");
 
 pub struct Db {
     conn: Connection,
@@ -53,6 +54,13 @@ impl Db {
                 .context("migration 003: session analytics columns failed")?;
             conn.execute_batch("PRAGMA user_version = 3;")
                 .context("migration 003: failed to set user_version")?;
+        }
+
+        if version < 4 {
+            conn.execute_batch(MIGRATION_004)
+                .context("migration 004: index creation failed")?;
+            conn.execute_batch("PRAGMA user_version = 4;")
+                .context("migration 004: failed to set user_version")?;
         }
 
         Ok(Self { conn })
@@ -253,29 +261,32 @@ impl Db {
 
         // Compute retention_score = (access_count + 1) / (1 + days_since_created * 0.05)
         // We compute in SQL using julianday arithmetic.
-        let count: u64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories
-                 WHERE status = 'active'
-                   AND (CAST(access_count AS REAL) + 1.0)
-                       / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
-                params![now_str, threshold],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u64)?;
-
-        if !dry_run && count > 0 {
-            self.conn.execute(
-                "UPDATE memories SET status = 'cold'
-                 WHERE status = 'active'
-                   AND (CAST(access_count AS REAL) + 1.0)
-                       / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
-                params![now_str, threshold],
-            )?;
+        if dry_run {
+            // COUNT only — no write, no TOCTOU window
+            let count: u64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories
+                     WHERE status = 'active'
+                       AND (CAST(access_count AS REAL) + 1.0)
+                           / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
+                    params![now_str, threshold],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n.max(0) as u64)?;
+            return Ok(count);
         }
 
-        Ok(count)
+        // Live path: single UPDATE then read changes() — eliminates TOCTOU between
+        // the COUNT and UPDATE that the previous two-query approach had.
+        self.conn.execute(
+            "UPDATE memories SET status = 'cold'
+             WHERE status = 'active'
+               AND (CAST(access_count AS REAL) + 1.0)
+                   / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
+            params![now_str, threshold],
+        )?;
+        Ok(self.conn.changes())
     }
 
     /// Set a memory's scope to 'global'.
@@ -350,41 +361,33 @@ impl Db {
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<DbStats> {
-        let memory_count: u64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
-            .map(|n| n.max(0) as u64)?;
-
-        let active_count: u64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE status = 'active'",
+        // Single aggregating query — avoids 4 separate full scans (N+1 pattern).
+        // COALESCE handles the NULL that SUM returns on an empty table.
+        let (memory_count, active_count, cold_count, project_count): (u64, u64, u64, u64) =
+            self.conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN status='active' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN status='cold' THEN 1 ELSE 0 END), 0),
+                        COUNT(DISTINCT CASE WHEN project IS NOT NULL THEN project END)
+                 FROM memories",
                 [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u64)?;
-
-        let cold_count: u64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE status = 'cold'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u64)?;
+                |r| {
+                    let mc: i64 = r.get(0)?;
+                    let ac: i64 = r.get(1)?;
+                    let cc: i64 = r.get(2)?;
+                    let pc: i64 = r.get(3)?;
+                    Ok((
+                        mc.max(0) as u64,
+                        ac.max(0) as u64,
+                        cc.max(0) as u64,
+                        pc.max(0) as u64,
+                    ))
+                },
+            )?;
 
         let session_count: u64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
-            .map(|n| n.max(0) as u64)?;
-
-        let project_count: u64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(DISTINCT project) FROM memories WHERE project IS NOT NULL",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
             .map(|n| n.max(0) as u64)?;
 
         // Propagate PRAGMA errors rather than silently reporting "0 KB"
@@ -876,13 +879,13 @@ mod tests {
     // ── Migration versioning tests ────────────────────────────────────────────
 
     #[test]
-    fn in_memory_db_has_user_version_3() {
+    fn in_memory_db_has_user_version_4() {
         let db = in_memory_db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3, "in-memory DB must migrate to version 3");
+        assert_eq!(version, 4, "in-memory DB must migrate to version 4");
     }
 
     #[test]
@@ -1332,7 +1335,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3, "user_version should remain 3 on reopen");
+        assert_eq!(version, 4, "user_version should remain 4 on reopen");
     }
 
     // ── Cold global memory excluded from scoped search ───────────────────────
