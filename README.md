@@ -52,6 +52,7 @@ Last: your-api — 2026-02-20 (3 files, 89 insertions)
 - **Memory decay** — Ebbinghaus-style scoring automatically archives stale memories; accessed ones stay sharp
 - **Cross-project memory** — promote a pattern to global scope; it appears in every project's context
 - **CLAUDE.md suggestions** — `mem suggest-rules` analyses your sessions and outputs rules ready to paste
+- **Session analytics** — `mem gain` shows token usage, cache efficiency, and top projects
 
 ## Install
 
@@ -133,6 +134,7 @@ Claude Code session
   └─ Stop hook  ← fires when session ends, with or without agent cooperation
         → parses hook stdin: cwd, session_id, transcript_path
         → captures git log (committed work) + git diff --stat
+        → parses transcript for token usage and turn counts
         → writes structured memory to ~/.mem/mem.db
         → no agent call required, no agent discipline required
 ```
@@ -175,12 +177,12 @@ Add to `~/.claude/settings.json` or a project `.mcp.json`:
 }
 ```
 
-**9 tools:**
+**10 tools:**
 
 | Tool | Purpose |
 |------|---------|
 | `mem_save` | Save a memory manually (decision, pattern, finding) |
-| `mem_search` | Full-text search with FTS5 query syntax; includes global memories |
+| `mem_search` | Full-text search with FTS5 + porter stemming; includes global memories |
 | `mem_context` | Load last N memories for a project; includes global memories |
 | `mem_get` | Fetch a memory by ID |
 | `mem_stats` | Database statistics (active/cold counts, projects, DB size) |
@@ -188,6 +190,7 @@ Add to `~/.claude/settings.json` or a project `.mcp.json`:
 | `mem_promote` | Promote a memory to global scope |
 | `mem_demote` | Demote a memory back to project scope |
 | `mem_suggest_rules` | Suggest CLAUDE.md rules from recurring session patterns |
+| `mem_gain` | Session analytics as JSON: tokens, cache efficiency, top projects |
 
 ## CLI
 
@@ -213,8 +216,11 @@ mem demote <id>                      # return a memory to project scope
 mem suggest-rules                    # analyse last 20 auto-captured memories
 mem suggest-rules --limit 50         # analyse more sessions
 
+# Session analytics
+mem gain                             # token usage, cache efficiency, top projects by tokens
+
 # Test your hook setup
-echo '{"cwd":"/your/project"}' | mem save --auto
+echo '{"cwd":"/your/project"}' | mem auto
 echo '{"cwd":"/your/project"}' | mem context --compact
 
 # Verify DB directly
@@ -249,16 +255,16 @@ Now every new Claude Code session opens with the last 3 session summaries alread
 
 ```
 src/
-  main.rs        CLI — subcommands: mcp, save, context, search, stats, decay, promote, demote, suggest-rules, tui
-  types.rs       Shared types: Memory, MemoryType, MemoryStatus, MemoryScope, HookStdin, CompactContextOutput
+  main.rs        CLI — subcommands: mcp, save, auto, context, search, stats, decay,
+                        promote, demote, suggest-rules, gain
+  types.rs       Domain types: Memory, MemoryType, MemoryStatus, MemoryScope,
+                        HookStdin, TranscriptAnalytics, GainStats
   db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic
-  auto.rs        Auto-capture — hook stdin parsing, git diff, title generation
-  mcp.rs         MCP server — rmcp 0.16, 9 tools, stdio transport
+  auto.rs        Auto-capture — hook stdin parsing, transcript analytics, git diff
+  mcp.rs         MCP server — rmcp 0.16, 10 tools, stdio transport
   suggest.rs     Rule suggestion engine — pure frequency analysis, no LLM
-  tui.rs         Interactive TUI (not yet implemented)
 migrations/
-  001_init.sql   Schema: memories + FTS5 triggers + sessions
-  002_decay_scope.sql  Adds access_count, last_accessed_at, status, scope columns
+  001_init.sql   Canonical schema: sessions + memories + FTS5 triggers + indexes
 hooks/
   mem-stop.sh           Stop hook wrapper
   mem-precompact.sh     PreCompact hook wrapper
@@ -279,7 +285,7 @@ hooks/
 | Cross-project memory | No | **Yes — promote any memory to global scope** |
 | Pattern extraction | Manual | **`suggest-rules` analyses sessions → CLAUDE.md rules** |
 | Search | Varies | **FTS5 + porter stemmer, full history** |
-| MCP tools | Varies | **9 built-in tools** |
+| MCP tools | Varies | **10 built-in tools** |
 
 ## Contributing
 

@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
+| 0.2.x   | ✅ |
 | 0.1.x   | ✅ |
 
 ## Reporting a Vulnerability
@@ -29,3 +30,9 @@ You'll receive a response within 48 hours. If confirmed, we'll coordinate a fix 
 - Executes `git` as a subprocess — no arbitrary command execution
 
 The MCP server (`mem mcp`) communicates only over stdio with the local Claude Code process.
+
+## Known attack surface
+
+- **Hook-injected `transcript_path`**: the Stop hook receives a `transcript_path` from Claude Code via stdin JSON. `mem` validates this path is absolute and contains no `..` components before reading it. Relative paths and path traversal attempts are rejected and logged to stderr.
+- **FTS5 query injection**: user-supplied search queries are phrase-quoted before being passed to SQLite's `MATCH` operator, preventing FTS5 operator injection.
+- **MCP input validation**: `mem_save` and `mem_search` validate that title, content, and query are non-blank before reaching the database layer, returning `INVALID_PARAMS` on bad input.

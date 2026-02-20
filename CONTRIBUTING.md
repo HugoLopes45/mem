@@ -17,7 +17,7 @@ cargo test
 cargo build
 
 # Test Stop hook simulation
-echo '{"cwd":"/tmp/test"}' | ./target/debug/mem save --auto
+echo '{"cwd":"/tmp/test"}' | ./target/debug/mem auto
 
 # Test PreCompact simulation
 echo '{"cwd":"/tmp/test"}' | ./target/debug/mem context --compact
@@ -31,13 +31,13 @@ echo '{"cwd":"/tmp/test"}' | ./target/debug/mem context --compact
 ```
 src/
   main.rs      CLI entry point — add new subcommands here
-  types.rs     Shared types — keep this small and stable
-  db.rs        All database logic — queries, migrations, FTS5
-  auto.rs      Auto-capture logic — hook stdin parsing, git diff
+  types.rs     Domain types — keep this small and stable
+  db.rs        All database logic — queries, schema, FTS5
+  auto.rs      Auto-capture logic — hook stdin parsing, transcript analytics, git diff
   mcp.rs       MCP server — add new tools here
-  tui.rs       Interactive TUI — ratatui (v0.2 scope)
+  suggest.rs   Rule suggestion engine
 migrations/
-  001_init.sql Schema — add new migrations as 002_, 003_, etc.
+  001_init.sql Canonical schema — edit this file to change the schema
 hooks/
   *.sh         Shell wrappers for Claude Code hook events
 ```
@@ -50,38 +50,26 @@ hooks/
 
 The `#[tool_handler]` macro on `ServerHandler` picks it up automatically.
 
-## Database changes
+## Database schema changes
 
-`mem` uses a versioned migration system keyed on SQLite's `PRAGMA user_version`. Each migration file is gated by a version check so it only runs once.
+`mem` uses a single canonical schema file (`migrations/001_init.sql`) applied once on a fresh database. All DDL uses `IF NOT EXISTS` so the batch is safe to re-run.
 
-To add a migration:
+`db.rs` gates the apply on `PRAGMA user_version < 1` — the version is advanced to 1 after the first successful apply and never re-applied.
 
-1. Create `migrations/003_your_change.sql` (increment the number)
-2. Wrap the DDL in a transaction and advance `user_version` **outside** the transaction:
+**To change the schema:**
 
-```sql
--- Migration 003: describe your change
--- Applied only when PRAGMA user_version < 3
-
-BEGIN;
-
-ALTER TABLE memories ADD COLUMN your_column TEXT;
-
-COMMIT;
-
--- user_version must be set outside the transaction for atomicity
-PRAGMA user_version = 3;
-```
-
-3. In `db.rs`, add a version-gated call alongside the existing migration checks:
+1. Edit `migrations/001_init.sql` directly — add your columns, indexes, or tables
+2. Bump `PRAGMA user_version` in `db.rs` if you need to apply an `ALTER TABLE` to existing databases:
 
 ```rust
-if user_version < 3 {
-    conn.execute_batch(include_str!("../migrations/003_your_change.sql"))?;
+// db.rs — add after the existing version < 1 block:
+if version < 2 {
+    conn.execute_batch("ALTER TABLE memories ADD COLUMN your_column TEXT;")?;
+    conn.execute_batch("PRAGMA user_version = 2;")?;
 }
 ```
 
-Do not use `conn.execute_batch` for the full migration chain without version gates — each migration must be idempotent and applied only once.
+For pre-release changes where no existing database needs upgrading (development-only), simply edit `001_init.sql` directly without adding a version block.
 
 ## Testing
 
@@ -93,15 +81,20 @@ Integration tests simulate hook stdin:
 
 ```bash
 echo '{"cwd":"/tmp/test","session_id":"test-123","stop_hook_active":false}' \
-  | MEM_DB=/tmp/test-mem.db cargo run -- save --auto
+  | MEM_DB=/tmp/test-mem.db ./target/debug/mem auto
 ```
+
+Coverage targets:
+- 80%+ overall
+- 100% for security-sensitive paths (e.g. `is_safe_transcript_path`)
 
 ## Pull requests
 
 - Keep PRs focused — one feature or fix per PR
-- Include a test for new behavior
+- Write a failing test before implementing new behaviour
 - Run `cargo clippy` before submitting
 - Update README if you add a CLI flag or MCP tool
+- Update CHANGELOG under `[Unreleased]`
 
 ## Reporting bugs
 
