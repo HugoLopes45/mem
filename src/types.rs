@@ -12,6 +12,10 @@ pub struct Memory {
     pub content: String,
     pub git_diff: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub access_count: u32,
+    pub last_accessed_at: Option<DateTime<Utc>>,
+    pub status: MemoryStatus,
+    pub scope: MemoryScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,6 +75,60 @@ impl From<UserMemoryType> for MemoryType {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryStatus {
+    Active,
+    Cold,
+}
+
+impl std::fmt::Display for MemoryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoryStatus::Active => write!(f, "active"),
+            MemoryStatus::Cold => write!(f, "cold"),
+        }
+    }
+}
+
+impl std::str::FromStr for MemoryStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "active" => Ok(MemoryStatus::Active),
+            "cold" => Ok(MemoryStatus::Cold),
+            other => Err(anyhow::anyhow!("unknown memory status: '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    Project,
+    Global,
+}
+
+impl std::fmt::Display for MemoryScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoryScope::Project => write!(f, "project"),
+            MemoryScope::Global => write!(f, "global"),
+        }
+    }
+}
+
+impl std::str::FromStr for MemoryScope {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "project" => Ok(MemoryScope::Project),
+            "global" => Ok(MemoryScope::Global),
+            other => Err(anyhow::anyhow!("unknown memory scope: '{other}'")),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct Session {
     pub id: String,
@@ -107,4 +165,32 @@ pub struct DbStats {
     pub session_count: u64,
     pub project_count: u64,
     pub db_size_bytes: u64,
+    pub active_count: u64,
+    pub cold_count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_status_from_str_roundtrip() {
+        assert_eq!(
+            "active".parse::<MemoryStatus>().unwrap(),
+            MemoryStatus::Active
+        );
+        assert_eq!("cold".parse::<MemoryStatus>().unwrap(), MemoryStatus::Cold);
+        assert!("Active".parse::<MemoryStatus>().is_err()); // case-sensitive
+        assert!("unknown".parse::<MemoryStatus>().is_err());
+    }
+
+    #[test]
+    fn memory_scope_from_str_roundtrip() {
+        assert_eq!(
+            "project".parse::<MemoryScope>().unwrap(),
+            MemoryScope::Project
+        );
+        assert!("Global".parse::<MemoryScope>().is_err()); // case-sensitive
+        assert!("unknown".parse::<MemoryScope>().is_err());
+    }
 }

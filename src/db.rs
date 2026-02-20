@@ -4,9 +4,9 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::types::{DbStats, Memory, MemoryType};
+use crate::types::{DbStats, Memory, MemoryScope, MemoryStatus, MemoryType};
 
-const MIGRATION: &str = include_str!("../migrations/001_init.sql");
+const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
 pub struct Db {
     conn: Connection,
@@ -26,8 +26,30 @@ impl Db {
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
         )?;
 
-        // Run migrations (idempotent — all statements use IF NOT EXISTS)
-        conn.execute_batch(MIGRATION)?;
+        // Versioned migrations via PRAGMA user_version
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+        if version < 1 {
+            // 001_init.sql uses IF NOT EXISTS throughout — safe to re-run
+            conn.execute_batch(MIGRATION_001)?;
+            conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
+
+        if version < 2 {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
+                 ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active' \
+                     CHECK(status IN ('active', 'cold'));
+                 ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'project' \
+                     CHECK(scope IN ('project', 'global'));
+                 COMMIT;",
+            )
+            .context("migration 002: schema changes failed")?;
+            conn.execute_batch("PRAGMA user_version = 2;")
+                .context("migration 002: failed to set user_version")?;
+        }
 
         Ok(Self { conn })
     }
@@ -69,17 +91,32 @@ impl Db {
             content: content.to_string(),
             git_diff: git_diff.map(String::from),
             created_at: now,
+            access_count: 0,
+            last_accessed_at: None,
+            status: MemoryStatus::Active,
+            scope: MemoryScope::Project,
         })
     }
 
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, project, title, type, content, git_diff, created_at
+            "SELECT id, session_id, project, title, type, content, git_diff, created_at,
+                    access_count, last_accessed_at, status, scope
              FROM memories WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(row_to_memory(row)?))
+            let mem = row_to_memory(row)?;
+            // Best-effort access tracking — do not fail the get if UPDATE fails
+            let now = Utc::now().to_rfc3339();
+            if let Err(e) = self.conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1
+                 WHERE id = ?2",
+                params![now, id],
+            ) {
+                eprintln!("[mem] warn: access tracking failed for {id}: {e}");
+            }
+            Ok(Some(mem))
         } else {
             Ok(None)
         }
@@ -97,50 +134,162 @@ impl Db {
         let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
-        if let Some(proj) = project {
+        let mems = if let Some(proj) = project {
+            // With --project: include project-scoped AND global memories
             let mut stmt = self.conn.prepare(
-                "SELECT m.id, m.session_id, m.project, m.title, m.type, m.content, m.git_diff, m.created_at
+                "SELECT m.id, m.session_id, m.project, m.title, m.type, m.content, m.git_diff,
+                        m.created_at, m.access_count, m.last_accessed_at, m.status, m.scope
                  FROM memories m
                  JOIN memories_fts fts ON m.rowid = fts.rowid
-                 WHERE memories_fts MATCH ?1 AND m.project = ?2
+                 WHERE memories_fts MATCH ?1
+                   AND (m.project = ?2 OR m.scope = 'global')
+                   AND m.status = 'active'
                  ORDER BY rank
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![safe_query, proj, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
         } else {
+            // Without --project: return all (project + global) active memories
             let mut stmt = self.conn.prepare(
-                "SELECT m.id, m.session_id, m.project, m.title, m.type, m.content, m.git_diff, m.created_at
+                "SELECT m.id, m.session_id, m.project, m.title, m.type, m.content, m.git_diff,
+                        m.created_at, m.access_count, m.last_accessed_at, m.status, m.scope
                  FROM memories m
                  JOIN memories_fts fts ON m.rowid = fts.rowid
                  WHERE memories_fts MATCH ?1
+                   AND m.status = 'active'
                  ORDER BY rank
                  LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![safe_query, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
-        }
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        let ids: Vec<String> = mems.iter().map(|m| m.id.clone()).collect();
+        self.track_access_batch(&ids);
+
+        Ok(mems)
     }
 
     pub fn recent_memories(&self, project: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
-        if let Some(proj) = project {
+        let mems = if let Some(proj) = project {
+            // Include project-scoped AND global active memories
             let mut stmt = self.conn.prepare(
-                "SELECT id, session_id, project, title, type, content, git_diff, created_at
-                 FROM memories WHERE project = ?1
+                "SELECT id, session_id, project, title, type, content, git_diff, created_at,
+                        access_count, last_accessed_at, status, scope
+                 FROM memories
+                 WHERE (project = ?1 OR scope = 'global') AND status = 'active'
                  ORDER BY created_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![proj, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT id, session_id, project, title, type, content, git_diff, created_at
-                 FROM memories ORDER BY created_at DESC LIMIT ?1",
+                "SELECT id, session_id, project, title, type, content, git_diff, created_at,
+                        access_count, last_accessed_at, status, scope
+                 FROM memories WHERE status = 'active'
+                 ORDER BY created_at DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        let ids: Vec<String> = mems.iter().map(|m| m.id.clone()).collect();
+        self.track_access_batch(&ids);
+
+        Ok(mems)
+    }
+
+    fn track_access_batch(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
         }
+        let now = chrono::Utc::now().to_rfc3339();
+        let placeholders: String = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 \
+             WHERE id IN ({placeholders})"
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+        for id in ids {
+            all_params.push(Box::new(id.clone()));
+        }
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+        // In `mem mcp` mode, stderr is observed by the MCP client (stdio transport).
+        // The "[mem]" prefix lets clients filter these warnings. Access tracking
+        // failures are non-fatal — they do not affect query results.
+        match self.conn.prepare(&sql) {
+            Err(e) => eprintln!("[mem] warn: access tracking prepare failed: {e}"),
+            Ok(mut stmt) => {
+                if let Err(e) = stmt.execute(params_refs.as_slice()) {
+                    eprintln!("[mem] warn: batch access tracking failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Run Ebbinghaus decay: mark memories below retention threshold as 'cold'.
+    /// Returns the count of memories marked cold.
+    /// If dry_run=true, returns what would be marked without making changes.
+    pub fn run_decay(&self, threshold: f64, dry_run: bool) -> Result<u64> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        // Compute retention_score = (access_count + 1) / (1 + days_since_created * 0.05)
+        // We compute in SQL using julianday arithmetic.
+        let count: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories
+                 WHERE status = 'active'
+                   AND (CAST(access_count AS REAL) + 1.0)
+                       / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
+                params![now_str, threshold],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)?;
+
+        if !dry_run && count > 0 {
+            self.conn.execute(
+                "UPDATE memories SET status = 'cold'
+                 WHERE status = 'active'
+                   AND (CAST(access_count AS REAL) + 1.0)
+                       / (1.0 + (julianday(?1) - julianday(created_at)) * 0.05) < ?2",
+                params![now_str, threshold],
+            )?;
+        }
+
+        Ok(count)
+    }
+
+    /// Set a memory's scope to 'global'.
+    pub fn promote_memory(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memories SET scope = 'global' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Set a memory's scope back to 'project'.
+    pub fn demote_memory(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memories SET scope = 'project' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
     }
 
     // ── Sessions ──────────────────────────────────────────────────────────────
@@ -169,6 +318,24 @@ impl Db {
         let memory_count: u64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as u64)?;
+
+        let active_count: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE status = 'active'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)?;
+
+        let cold_count: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE status = 'cold'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
             .map(|n| n.max(0) as u64)?;
 
         let session_count: u64 = self
@@ -201,33 +368,82 @@ impl Db {
             session_count,
             project_count,
             db_size_bytes,
+            active_count,
+            cold_count,
         })
+    }
+
+    // ── suggest-rules helpers ─────────────────────────────────────────────────
+
+    /// Load the last N auto-captured memories for pattern analysis.
+    pub fn recent_auto_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, project, title, type, content, git_diff, created_at,
+                    access_count, last_accessed_at, status, scope
+             FROM memories WHERE type = 'auto'
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit_i64], row_to_memory)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
 
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
-    let type_str: String = row.get(4)?;
-    let created_at_str: String = row.get(7)?;
+    let type_str: String = row.get("type")?;
+    let created_at_str: String = row.get("created_at")?;
 
     let memory_type = type_str.parse::<MemoryType>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     })?;
 
     let created_at = created_at_str.parse().map_err(|e: chrono::ParseError| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
     Ok(Memory {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        project: row.get(2)?,
-        title: row.get(3)?,
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        project: row.get("project")?,
+        title: row.get("title")?,
         memory_type,
-        content: row.get(5)?,
-        git_diff: row.get(6)?,
+        content: row.get("content")?,
+        git_diff: row.get("git_diff")?,
         created_at,
+        access_count: {
+            let ac: i64 = row.get("access_count")?;
+            // The schema enforces NOT NULL DEFAULT 0, so negative values are
+            // impossible. Values exceeding u32::MAX (~4 billion accesses) are
+            // implausible in practice; saturate to 0 rather than propagating an error.
+            u32::try_from(ac).unwrap_or(0)
+        },
+        last_accessed_at: {
+            let la: Option<String> = row.get("last_accessed_at")?;
+            la.map(|s| {
+                s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?
+        },
+        status: {
+            let s: String = row.get("status")?;
+            s.parse::<MemoryStatus>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+            })?
+        },
+        scope: {
+            let s: String = row.get("scope")?;
+            s.parse::<MemoryScope>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+            })?
+        },
     })
 }
 
@@ -565,5 +781,488 @@ mod tests {
         let r2 = db.search_memories("tested", None, 10).unwrap();
         assert!(!r1.is_empty(), "porter stemmer should match 'testing'");
         assert!(!r2.is_empty(), "porter stemmer should match 'tested'");
+    }
+
+    // ── Migration versioning tests ────────────────────────────────────────────
+
+    #[test]
+    fn in_memory_db_has_user_version_2() {
+        let db = in_memory_db();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "in-memory DB must migrate to version 2");
+    }
+
+    #[test]
+    fn memories_table_has_new_columns() {
+        let db = in_memory_db();
+        // Inserting a memory and reading it back confirms the schema has the new columns
+        let mem = db
+            .save_memory("title", MemoryType::Manual, "content", None, None, None)
+            .unwrap();
+        assert_eq!(mem.access_count, 0);
+        assert_eq!(mem.status, MemoryStatus::Active);
+        assert_eq!(mem.scope, MemoryScope::Project);
+        assert!(mem.last_accessed_at.is_none());
+    }
+
+    // ── Access tracking tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_memory_increments_access_count() {
+        let db = in_memory_db();
+        let mem = db
+            .save_memory("title", MemoryType::Manual, "content", None, None, None)
+            .unwrap();
+        assert_eq!(mem.access_count, 0);
+
+        // get_memory returns the pre-update value (snapshot before tracking fires)
+        db.get_memory(&mem.id).unwrap();
+
+        // Read the updated value directly
+        let updated: i64 = db
+            .conn
+            .query_row(
+                "SELECT access_count FROM memories WHERE id = ?1",
+                params![mem.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "access_count should be 1 after one get");
+    }
+
+    #[test]
+    fn search_memories_increments_access_count() {
+        let db = in_memory_db();
+        let mem = db
+            .save_memory(
+                "rust async runtime",
+                MemoryType::Manual,
+                "tokio is used for async",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        db.search_memories("rust", None, 10).unwrap();
+
+        let updated: i64 = db
+            .conn
+            .query_row(
+                "SELECT access_count FROM memories WHERE id = ?1",
+                params![mem.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+
+    #[test]
+    fn recent_memories_increments_access_count() {
+        let db = in_memory_db();
+        let mem = db
+            .save_memory("title", MemoryType::Manual, "content", None, None, None)
+            .unwrap();
+
+        db.recent_memories(None, 10).unwrap();
+
+        let updated: i64 = db
+            .conn
+            .query_row(
+                "SELECT access_count FROM memories WHERE id = ?1",
+                params![mem.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+
+    // ── Decay tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn decay_marks_never_accessed_memory_cold() {
+        let db = in_memory_db();
+        // A memory with access_count=0 and created_at = now:
+        // retention = (0+1)/(1 + 0*0.05) = 1.0/1.0 = 1.0
+        // Only becomes cold with high threshold. Use threshold 2.0 to force cold.
+        db.save_memory("old memory", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+
+        let count = db.run_decay(2.0, false).unwrap();
+        assert_eq!(count, 1, "one memory should be marked cold");
+
+        let s = db.stats().unwrap();
+        assert_eq!(s.cold_count, 1);
+        assert_eq!(s.active_count, 0);
+    }
+
+    #[test]
+    fn decay_dry_run_does_not_change_status() {
+        let db = in_memory_db();
+        db.save_memory("title", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+
+        let count = db.run_decay(2.0, true).unwrap();
+        assert_eq!(count, 1, "dry-run should report 1 would be marked cold");
+
+        let s = db.stats().unwrap();
+        assert_eq!(s.cold_count, 0, "dry-run must not change status");
+        assert_eq!(s.active_count, 1);
+    }
+
+    #[test]
+    fn decay_excludes_already_cold_memories() {
+        let db = in_memory_db();
+        db.save_memory("m1", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+
+        // Mark cold once
+        db.run_decay(2.0, false).unwrap();
+        // Run again — should report 0 (already cold, filtered by WHERE status='active')
+        let count = db.run_decay(2.0, false).unwrap();
+        assert_eq!(count, 0, "already-cold memories should not be re-counted");
+    }
+
+    #[test]
+    fn recent_memories_excludes_cold() {
+        let db = in_memory_db();
+        db.save_memory(
+            "active mem",
+            MemoryType::Auto,
+            "active content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.save_memory(
+            "cold mem",
+            MemoryType::Auto,
+            "cold content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Mark all cold then re-save one active
+        db.run_decay(2.0, false).unwrap();
+        db.save_memory(
+            "new active",
+            MemoryType::Auto,
+            "new content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let recents = db.recent_memories(None, 10).unwrap();
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].title, "new active");
+    }
+
+    #[test]
+    fn stats_reports_active_and_cold_counts() {
+        let db = in_memory_db();
+        db.save_memory("m1", MemoryType::Auto, "c1", None, None, None)
+            .unwrap();
+        db.save_memory("m2", MemoryType::Auto, "c2", None, None, None)
+            .unwrap();
+        db.save_memory("m3", MemoryType::Auto, "c3", None, None, None)
+            .unwrap();
+
+        db.run_decay(2.0, false).unwrap(); // marks all 3 cold
+
+        let s = db.stats().unwrap();
+        assert_eq!(s.cold_count, 3);
+        assert_eq!(s.active_count, 0);
+        assert_eq!(s.memory_count, 3);
+    }
+
+    // ── Promote / demote tests ────────────────────────────────────────────────
+
+    #[test]
+    fn promote_sets_scope_global() {
+        let db = in_memory_db();
+        let mem = db
+            .save_memory(
+                "title",
+                MemoryType::Manual,
+                "content",
+                Some("/proj"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(mem.scope, MemoryScope::Project);
+
+        let changed = db.promote_memory(&mem.id).unwrap();
+        assert!(changed);
+
+        let scope: String = db
+            .conn
+            .query_row(
+                "SELECT scope FROM memories WHERE id = ?1",
+                params![mem.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "global");
+    }
+
+    #[test]
+    fn demote_sets_scope_project() {
+        let db = in_memory_db();
+        let mem = db
+            .save_memory(
+                "title",
+                MemoryType::Manual,
+                "content",
+                Some("/proj"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        db.promote_memory(&mem.id).unwrap();
+        let changed = db.demote_memory(&mem.id).unwrap();
+        assert!(changed);
+
+        let scope: String = db
+            .conn
+            .query_row(
+                "SELECT scope FROM memories WHERE id = ?1",
+                params![mem.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "project");
+    }
+
+    #[test]
+    fn promote_returns_false_for_missing_id() {
+        let db = in_memory_db();
+        let changed = db.promote_memory("nonexistent-id").unwrap();
+        assert!(!changed);
+    }
+
+    // ── Scope-aware search / context tests ───────────────────────────────────
+
+    #[test]
+    fn search_with_project_includes_global_memories() {
+        let db = in_memory_db();
+        // Save a memory in /proj-a
+        let _m1 = db
+            .save_memory(
+                "project auth",
+                MemoryType::Decision,
+                "JWT for proj-a",
+                Some("/proj-a"),
+                None,
+                None,
+            )
+            .unwrap();
+        // Save a memory in /proj-b and promote to global
+        let m2 = db
+            .save_memory(
+                "global auth pattern",
+                MemoryType::Pattern,
+                "JWT refresh tokens global",
+                Some("/proj-b"),
+                None,
+                None,
+            )
+            .unwrap();
+        db.promote_memory(&m2.id).unwrap();
+
+        // Search scoped to /proj-a — should get both proj-a and global
+        let results = db.search_memories("auth", Some("/proj-a"), 10).unwrap();
+        assert_eq!(results.len(), 2, "should find proj-a and global memories");
+    }
+
+    #[test]
+    fn recent_with_project_includes_global_memories() {
+        let db = in_memory_db();
+        db.save_memory(
+            "proj-a memory",
+            MemoryType::Auto,
+            "content a",
+            Some("/proj-a"),
+            None,
+            None,
+        )
+        .unwrap();
+        let m2 = db
+            .save_memory(
+                "global memory",
+                MemoryType::Auto,
+                "global content",
+                Some("/proj-b"),
+                None,
+                None,
+            )
+            .unwrap();
+        db.promote_memory(&m2.id).unwrap();
+
+        let recents = db.recent_memories(Some("/proj-a"), 10).unwrap();
+        assert_eq!(
+            recents.len(),
+            2,
+            "project + global memories should be included"
+        );
+    }
+
+    // ── suggest-rules helper test ─────────────────────────────────────────────
+
+    #[test]
+    fn recent_auto_memories_filters_by_type() {
+        let db = in_memory_db();
+        db.save_memory(
+            "auto mem",
+            MemoryType::Auto,
+            "auto content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.save_memory(
+            "manual mem",
+            MemoryType::Manual,
+            "manual content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let autos = db.recent_auto_memories(10).unwrap();
+        assert_eq!(autos.len(), 1);
+        assert_eq!(autos[0].title, "auto mem");
+    }
+
+    // ── Decay formula tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn decay_formula_ages_old_memory_correctly() {
+        let db = in_memory_db();
+        let m = db
+            .save_memory(
+                "old title",
+                MemoryType::Auto,
+                "old content",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // Simulate 40-day-old memory: score = (0+1)/(1+40*0.05) = 1/3 ≈ 0.33
+        let forty_days_ago = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+        db.conn
+            .execute(
+                "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![forty_days_ago, m.id],
+            )
+            .unwrap();
+        // Should decay at threshold=0.4 (score 0.33 < 0.4)
+        assert_eq!(
+            db.run_decay(0.4, false).unwrap(),
+            1,
+            "40-day-old memory should be cold at 0.4"
+        );
+        // Should survive at threshold=0.3 (score 0.33 > 0.3) — need fresh DB
+        let db2 = in_memory_db();
+        let m2 = db2
+            .save_memory("old2", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+        db2.conn
+            .execute(
+                "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![forty_days_ago, m2.id],
+            )
+            .unwrap();
+        assert_eq!(
+            db2.run_decay(0.3, false).unwrap(),
+            0,
+            "40-day-old memory should survive at 0.3"
+        );
+    }
+
+    #[test]
+    fn decay_formula_survives_high_access_count() {
+        let db = in_memory_db();
+        let m = db
+            .save_memory("accessed", MemoryType::Auto, "content", None, None, None)
+            .unwrap();
+        // Simulate 10 accesses: score = (10+1)/(1+0*0.05) = 11.0
+        db.conn
+            .execute(
+                "UPDATE memories SET access_count = 10 WHERE id = ?1",
+                rusqlite::params![m.id],
+            )
+            .unwrap();
+        // Should survive threshold=1.5 (score 11.0 >> 1.5)
+        assert_eq!(
+            db.run_decay(1.5, false).unwrap(),
+            0,
+            "heavily accessed memory should not decay"
+        );
+    }
+
+    // ── Migration idempotency test ───────────────────────────────────────────
+
+    #[test]
+    fn migration_is_idempotent_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.db");
+        // First open runs migrations
+        Db::open(&path).expect("first open must succeed");
+        // Second open must not error — migration guard prevents re-running ALTER TABLE
+        let db2 = Db::open(&path).expect("second open must succeed");
+        let version: i64 = db2
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "user_version should remain 2 on reopen");
+    }
+
+    // ── Cold global memory excluded from scoped search ───────────────────────
+
+    #[test]
+    fn search_excludes_cold_global_memories() {
+        let db = in_memory_db();
+        let m = db
+            .save_memory(
+                "global cold memory",
+                MemoryType::Pattern,
+                "global content cold",
+                Some("/other-project"),
+                None,
+                None,
+            )
+            .unwrap();
+        db.promote_memory(&m.id).unwrap();
+        // Force decay (use threshold=2.0 to mark as cold regardless of age)
+        let count = db.run_decay(2.0, false).unwrap();
+        assert_eq!(count, 1, "memory should be marked cold");
+        // Should not appear in search for /proj-a
+        let results = db.search_memories("global", Some("/proj-a"), 10).unwrap();
+        assert!(
+            results.is_empty(),
+            "cold global memory must not appear in search"
+        );
+    }
+
+    // ── Demote missing ID ────────────────────────────────────────────────────
+
+    #[test]
+    fn demote_returns_false_for_missing_id() {
+        let db = in_memory_db();
+        let result = db.demote_memory("nonexistent-id-xyz").unwrap();
+        assert!(!result, "demote should return false for nonexistent ID");
     }
 }

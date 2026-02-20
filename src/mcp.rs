@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::auto::format_context_markdown;
 use crate::db::Db;
+use crate::suggest::suggest_rules;
 use crate::types::{MemoryType, UserMemoryType};
 
 fn mcp_err(msg: impl std::fmt::Display) -> McpError {
@@ -63,7 +64,7 @@ impl rmcp::schemars::JsonSchema for UserMemoryType {
 struct SearchParams {
     /// Full-text search query (FTS5 with porter stemming)
     query: String,
-    /// Filter by project path (optional)
+    /// Filter by project path (optional). Also includes global memories.
     project: Option<String>,
     /// Max results — capped at 200 (default 10)
     #[serde(default = "default_limit")]
@@ -101,6 +102,23 @@ struct SessionStartParams {
     goal: Option<String>,
     /// Session ID (use $CLAUDE_SESSION_ID from env)
     session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PromoteDemoteParams {
+    /// Memory ID (UUID)
+    id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SuggestRulesParams {
+    /// Number of recent auto-captured memories to analyse (default 20)
+    #[serde(default = "default_suggest_limit")]
+    limit: u32,
+}
+
+fn default_suggest_limit() -> u32 {
+    20
 }
 
 // ── Tool implementations ──────────────────────────────────────────────────────
@@ -141,12 +159,15 @@ impl MemServer {
         .map_err(mcp_err)?
         .map_err(mcp_err)?;
 
-        ok_text(format!("Saved memory: {} (id: {})", mem.title, mem.id))
+        ok_text(format!(
+            "Saved memory: {} (id: {}, scope: {})",
+            mem.title, mem.id, mem.scope
+        ))
     }
 
     /// Full-text search memories using FTS5 with porter stemming.
     #[tool(
-        description = "Search memories using full-text search. Input is treated as a phrase search — no FTS5 syntax required. Results ordered by relevance."
+        description = "Search memories using full-text search. Input is treated as a phrase search — no FTS5 syntax required. Results ordered by relevance. Includes global memories when project is specified."
     )]
     async fn mem_search(
         &self,
@@ -175,9 +196,10 @@ impl MemServer {
             .iter()
             .map(|m| {
                 format!(
-                    "**{}** ({})\n{}\n---",
+                    "**{}** ({}) [scope: {}]\n{}\n---",
                     m.title,
                     m.created_at.format("%Y-%m-%d"),
+                    m.scope,
                     m.content
                 )
             })
@@ -188,7 +210,7 @@ impl MemServer {
 
     /// Get recent memories for a project — for loading context at session start.
     #[tool(
-        description = "Get recent memories for a project. Returns last N session summaries as context. Use at session start to restore prior context."
+        description = "Get recent memories for a project. Returns last N session summaries as context. Includes global memories in addition to project-scoped ones. Use at session start to restore prior context."
     )]
     async fn mem_context(
         &self,
@@ -213,7 +235,7 @@ impl MemServer {
     }
 
     /// Get a single memory by ID.
-    #[tool(description = "Get full details of a memory by its ID.")]
+    #[tool(description = "Get full details of a memory by its ID. Response includes scope field.")]
     async fn mem_get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let db = self.db.clone();
@@ -236,9 +258,9 @@ impl MemServer {
         }
     }
 
-    /// Database statistics — memory count, sessions, projects, DB size.
+    /// Database statistics — memory count, sessions, projects, active/cold counts, DB size.
     #[tool(
-        description = "Show database statistics: total memories, sessions, projects tracked, and DB size on disk."
+        description = "Show database statistics: total memories, active vs cold counts, sessions, projects tracked, and DB size on disk."
     )]
     async fn mem_stats(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.clone();
@@ -254,8 +276,10 @@ impl MemServer {
         .map_err(mcp_err)?;
 
         ok_text(format!(
-            "Memories: {}\nSessions: {}\nProjects: {}\nDB size: {} KB",
+            "Memories: {} ({} active, {} cold)\nSessions: {}\nProjects: {}\nDB size: {} KB",
             s.memory_count,
+            s.active_count,
+            s.cold_count,
             s.session_count,
             s.project_count,
             s.db_size_bytes / 1024,
@@ -288,6 +312,92 @@ impl MemServer {
         .map_err(mcp_err)?;
 
         ok_text(format!("Session started: {session_id}"))
+    }
+
+    /// Promote a memory to global scope — makes it visible across all projects.
+    #[tool(
+        description = "Promote a memory to global scope. Global memories appear in search and context for all projects, not just the project they were captured in."
+    )]
+    async fn mem_promote(
+        &self,
+        params: Parameters<PromoteDemoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = params.0.id;
+        let db = self.db.clone();
+        let id_display = id.clone();
+
+        let changed = tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            db.promote_memory(&id)
+        })
+        .await
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
+
+        if changed {
+            ok_text(format!("Memory {id_display} promoted to global scope."))
+        } else {
+            ok_text(format!("No memory found with id: {id_display}"))
+        }
+    }
+
+    /// Demote a memory back to project scope.
+    #[tool(
+        description = "Demote a memory from global back to project scope. It will no longer appear cross-project."
+    )]
+    async fn mem_demote(
+        &self,
+        params: Parameters<PromoteDemoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = params.0.id;
+        let db = self.db.clone();
+        let id_display = id.clone();
+
+        let changed = tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            db.demote_memory(&id)
+        })
+        .await
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
+
+        if changed {
+            ok_text(format!("Memory {id_display} demoted to project scope."))
+        } else {
+            ok_text(format!("No memory found with id: {id_display}"))
+        }
+    }
+
+    /// Suggest CLAUDE.md rules from recurring patterns in auto-captured memories.
+    #[tool(
+        description = "Analyse recent auto-captured memories for recurring terms/phrases and suggest CLAUDE.md-ready rules. Uses pure frequency analysis — no LLM calls."
+    )]
+    async fn mem_suggest_rules(
+        &self,
+        params: Parameters<SuggestRulesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.0.limit as usize;
+        let db = self.db.clone();
+
+        let memories = tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            db.recent_auto_memories(limit)
+        })
+        .await
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
+
+        if memories.is_empty() {
+            return ok_text("No auto-captured memories found. Run some sessions with the Stop hook enabled first.");
+        }
+
+        ok_text(suggest_rules(&memories, limit))
     }
 }
 

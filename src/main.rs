@@ -1,6 +1,7 @@
 mod auto;
 mod db;
 mod mcp;
+mod suggest;
 mod tui;
 mod types;
 
@@ -14,10 +15,13 @@ use db::Db;
 use types::{CompactContextOutput, MemoryType};
 
 fn default_db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".mem")
-        .join("mem.db")
+    match dirs::home_dir() {
+        Some(home) => home.join(".mem").join("mem.db"),
+        None => {
+            eprintln!("[mem] warn: $HOME not set — using /tmp/.mem/mem.db (data will not persist across reboots)");
+            PathBuf::from("/tmp").join(".mem").join("mem.db")
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -95,7 +99,37 @@ enum Commands {
     /// Show database statistics
     Stats,
 
-    /// Interactive search TUI
+    /// Mark low-retention memories as cold (Ebbinghaus decay)
+    Decay {
+        /// Retention score threshold — memories below this are marked cold
+        #[arg(long, default_value_t = 0.1)]
+        threshold: f64,
+
+        /// Show what would be marked without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Promote a memory to global scope (visible across all projects)
+    Promote {
+        /// Memory ID to promote
+        id: String,
+    },
+
+    /// Demote a memory back to project scope
+    Demote {
+        /// Memory ID to demote
+        id: String,
+    },
+
+    /// Suggest CLAUDE.md rules from recurring patterns in auto-captured memories
+    SuggestRules {
+        /// Number of recent auto-captured memories to analyse
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+
+    /// Interactive search TUI (not yet implemented)
     Tui,
 }
 
@@ -130,7 +164,14 @@ fn main() -> Result<()> {
             limit,
         } => cmd_search(db_path, query, project, limit),
         Commands::Stats => cmd_stats(db_path),
-        Commands::Tui => tui::run_tui(db_path),
+        Commands::Decay { threshold, dry_run } => cmd_decay(db_path, threshold, dry_run),
+        Commands::Promote { id } => cmd_promote(db_path, id),
+        Commands::Demote { id } => cmd_demote(db_path, id),
+        Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
+        Commands::Tui => {
+            println!("TUI not yet implemented. Use `mem search <query>` for now.");
+            Ok(())
+        }
     }
 }
 
@@ -189,10 +230,16 @@ fn cmd_context(
                 std::io::stdin()
                     .read_to_string(&mut buf)
                     .context("reading hook stdin for cwd")?;
-                let hook: types::HookStdin = serde_json::from_str(&buf).unwrap_or_default();
-                hook.cwd.as_deref().and_then(|cwd| {
-                    auto::git_repo_root(std::path::Path::new(cwd)).or_else(|| Some(cwd.to_string()))
-                })
+                match serde_json::from_str::<types::HookStdin>(&buf) {
+                    Ok(hook) => hook.cwd.as_deref().and_then(|cwd| {
+                        auto::git_repo_root(std::path::Path::new(cwd))
+                            .or_else(|| Some(cwd.to_string()))
+                    }),
+                    Err(e) => {
+                        eprintln!("[mem] warn: failed to parse hook stdin JSON in context: {e}");
+                        None
+                    }
+                }
             }
         }
     };
@@ -231,10 +278,11 @@ fn cmd_search(
 
     for m in &results {
         println!(
-            "[{}] {} ({})\n  {}\n",
+            "[{}] {} ({}) [{}]\n  {}\n",
             m.memory_type,
             m.title,
             m.created_at.format("%Y-%m-%d"),
+            m.scope,
             m.content.lines().next().unwrap_or(""),
         );
     }
@@ -248,10 +296,61 @@ fn cmd_stats(db_path: PathBuf) -> Result<()> {
     }
     let db = Db::open(&db_path)?;
     let s = db.stats()?;
-    println!("Memories : {}", s.memory_count);
+    println!(
+        "Memories : {} ({} active, {} cold)",
+        s.memory_count, s.active_count, s.cold_count
+    );
     println!("Sessions : {}", s.session_count);
     println!("Projects : {}", s.project_count);
     println!("DB size  : {} KB", s.db_size_bytes / 1024);
     println!("DB path  : {}", db_path.display());
+    Ok(())
+}
+
+fn cmd_decay(db_path: PathBuf, threshold: f64, dry_run: bool) -> Result<()> {
+    let db = Db::open(&db_path)?;
+    let count = db.run_decay(threshold, dry_run)?;
+
+    if dry_run {
+        println!(
+            "{count} memories would be marked cold (threshold: {threshold:.2}) [dry-run — no changes made]"
+        );
+    } else {
+        println!("{count} memories marked cold (threshold: {threshold:.2})");
+    }
+    Ok(())
+}
+
+fn cmd_promote(db_path: PathBuf, id: String) -> Result<()> {
+    let db = Db::open(&db_path)?;
+    if db.promote_memory(&id)? {
+        println!("Memory {id} promoted to global scope.");
+        Ok(())
+    } else {
+        anyhow::bail!("No memory found with id: {id}")
+    }
+}
+
+fn cmd_demote(db_path: PathBuf, id: String) -> Result<()> {
+    let db = Db::open(&db_path)?;
+    if db.demote_memory(&id)? {
+        println!("Memory {id} demoted to project scope.");
+        Ok(())
+    } else {
+        anyhow::bail!("No memory found with id: {id}")
+    }
+}
+
+fn cmd_suggest_rules(db_path: PathBuf, limit: usize) -> Result<()> {
+    let db = Db::open(&db_path)?;
+    let memories = db.recent_auto_memories(limit)?;
+
+    if memories.is_empty() {
+        println!("No auto-captured memories found. Run some sessions with the Stop hook first.");
+        return Ok(());
+    }
+
+    let output = suggest::suggest_rules(&memories, limit);
+    print!("{output}");
     Ok(())
 }
