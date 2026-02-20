@@ -145,6 +145,14 @@ Storage: `~/.mem/mem.db` — single SQLite file, WAL mode, FTS5 full-text search
 
 Every memory has a **scope** (project or global) and a **status** (active or cold).
 
+Hard deletion is also available when you want to permanently remove a memory:
+
+```bash
+mem delete <id>   # irreversible — removes the row entirely
+```
+
+For soft archival (keeps the row, excludes it from results), use `mem decay` instead.
+
 **Scope** controls visibility:
 - `project` (default) — only visible when searching within that project
 - `global` — visible across all projects; use for cross-cutting rules and conventions
@@ -209,6 +217,7 @@ mem save \
 # Memory lifecycle
 mem decay --dry-run                  # preview what would be archived
 mem decay --threshold 0.1            # archive low-retention memories
+mem delete <id>                      # hard-delete a memory (irreversible)
 mem promote <id>                     # make a memory visible across all projects
 mem demote <id>                      # return a memory to project scope
 
@@ -256,7 +265,7 @@ Now every new Claude Code session opens with the last 3 session summaries alread
 ```
 src/
   main.rs        CLI — subcommands: mcp, save, auto, context, search, stats, decay,
-                        promote, demote, suggest-rules, gain
+                        promote, demote, suggest-rules, gain, delete
   types.rs       Domain types: Memory, MemoryType, MemoryStatus, MemoryScope,
                         HookStdin, TranscriptAnalytics, GainStats
   db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic

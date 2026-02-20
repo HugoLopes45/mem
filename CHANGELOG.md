@@ -5,19 +5,28 @@ All notable changes to `mem` will be documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-02-20
+
+### Added
+- `mem delete <id>` — hard-delete a memory by ID (irreversible; use `mem decay` for soft archival)
+- 20 new MCP handler tests covering all 10 tools: validation, limit capping, session ID generation, save/search/get/stats/context/promote/demote/suggest_rules/gain
+- `cargo audit` step in CI — blocks on CVE findings before build
 
 ### Changed
+- `lock_db()` helper in `mcp.rs` replaces 10× copy-pasted mutex guard pattern
+- Mutex poison now returns an MCP error instead of continuing with a potentially corrupt `rusqlite::Connection`
+- `track_access_batch` in `db.rs` uses a transaction + per-ID loop instead of dynamic SQL string building
+- `split_tokens()` extracted as a shared helper in `suggest.rs`; `tokenize()` delegates to it
 - Squashed pre-release incremental migrations (002–005) into a single canonical `001_init.sql`
 - `db.rs` migration chain simplified to a single version gate
 
 ### Fixed
+- `suggest.rs` stop-word list had `"2026"` hardcoded — replaced with `is_year_token()` covering 2000–2099; no manual updates needed
 - MCP `mem_search`: blank query now returns `INVALID_PARAMS` instead of hitting FTS5 with a malformed MATCH expression
-- Mutex poison recovery message was factually wrong ("state is intact"); now accurately describes the risk
-- Stale `mem save --auto` references in comments and docs updated to `mem auto`
+- Stale `mem save --auto` references in comments updated to `mem auto`
 
 ### Tests
-- Added 20 tests (65 → 85): path traversal guard, `format_duration`/`format_tokens`/`efficiency_bar`, `MemoryType` roundtrip and error messages, `UserMemoryType` invariants
+- Added 20 MCP handler tests (85 → 104 total): limit capping, empty-query rejection, session ID fallback, roundtrip promote/demote
 
 ## [0.2.0] — 2026-02-20
 
@@ -71,6 +80,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hook scripts: `mem-stop.sh`, `mem-precompact.sh`, `mem-session-start.sh`
 - Zero system dependencies — SQLite statically linked via `rusqlite --bundled`
 
-[Unreleased]: https://github.com/HugoLopes45/mem/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/HugoLopes45/mem/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/HugoLopes45/mem/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/HugoLopes45/mem/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/HugoLopes45/mem/releases/tag/v0.1.0
