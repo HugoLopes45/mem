@@ -9,10 +9,7 @@ use crate::types::{
     TranscriptAnalytics,
 };
 
-const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
-const MIGRATION_002: &str = include_str!("../migrations/002_decay_scope.sql");
-const MIGRATION_003: &str = include_str!("../migrations/003_session_analytics.sql");
-const MIGRATION_004: &str = include_str!("../migrations/004_indexes.sql");
+const SCHEMA: &str = include_str!("../migrations/001_init.sql");
 
 pub struct Db {
     conn: Connection,
@@ -33,34 +30,12 @@ impl Db {
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
 
-        // Versioned migrations via PRAGMA user_version
+        // Apply schema on first open. All DDL uses IF NOT EXISTS — safe to re-run.
+        // user_version gates the apply so the batch is skipped on every subsequent open.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-
         if version < 1 {
-            // 001_init.sql uses IF NOT EXISTS throughout — safe to re-run
-            conn.execute_batch(MIGRATION_001)?;
+            conn.execute_batch(SCHEMA).context("schema init failed")?;
             conn.execute_batch("PRAGMA user_version = 1;")?;
-        }
-
-        if version < 2 {
-            conn.execute_batch(MIGRATION_002)
-                .context("migration 002: schema changes failed")?;
-            conn.execute_batch("PRAGMA user_version = 2;")
-                .context("migration 002: failed to set user_version")?;
-        }
-
-        if version < 3 {
-            conn.execute_batch(MIGRATION_003)
-                .context("migration 003: session analytics columns failed")?;
-            conn.execute_batch("PRAGMA user_version = 3;")
-                .context("migration 003: failed to set user_version")?;
-        }
-
-        if version < 4 {
-            conn.execute_batch(MIGRATION_004)
-                .context("migration 004: index creation failed")?;
-            conn.execute_batch("PRAGMA user_version = 4;")
-                .context("migration 004: failed to set user_version")?;
         }
 
         Ok(Self { conn })
@@ -879,13 +854,13 @@ mod tests {
     // ── Migration versioning tests ────────────────────────────────────────────
 
     #[test]
-    fn in_memory_db_has_user_version_4() {
+    fn in_memory_db_has_user_version_1() {
         let db = in_memory_db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "in-memory DB must migrate to version 4");
+        assert_eq!(version, 1, "in-memory DB must be at schema version 1");
     }
 
     #[test]
@@ -1335,7 +1310,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "user_version should remain 4 on reopen");
+        assert_eq!(version, 1, "user_version should remain 1 on reopen");
     }
 
     // ── Cold global memory excluded from scoped search ───────────────────────

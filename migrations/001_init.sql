@@ -1,27 +1,38 @@
 -- mem: persistent memory for Claude Code sessions
 -- Storage: SQLite WAL + FTS5
+-- This is the canonical schema. Applied once on a fresh database (user_version 0 → 1).
+-- All prior incremental migrations (002–005) have been squashed into this file.
 
 -- Session tracking (created first; memories.session_id references this table)
 CREATE TABLE IF NOT EXISTS sessions (
-    id         TEXT PRIMARY KEY,
-    project    TEXT,
-    goal       TEXT,
-    started_at TEXT NOT NULL,
-    ended_at   TEXT,
-    turn_count INTEGER DEFAULT 0
+    id                    TEXT PRIMARY KEY,
+    project               TEXT,
+    goal                  TEXT,
+    started_at            TEXT NOT NULL,
+    ended_at              TEXT,
+    turn_count            INTEGER NOT NULL DEFAULT 0,
+    duration_secs         INTEGER NOT NULL DEFAULT 0,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS memories (
-    id         TEXT PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     -- ON DELETE SET NULL: deleting a session leaves its memories intact (orphaned sessions
     -- are not expected in normal operation, but the FK guards against dangling references).
-    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
-    project    TEXT,
-    title      TEXT NOT NULL,
-    type       TEXT NOT NULL CHECK(type IN ('auto','manual','pattern','decision')),
-    content    TEXT NOT NULL,
-    git_diff   TEXT,
-    created_at TEXT NOT NULL
+    session_id      TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    project         TEXT,
+    title           TEXT NOT NULL,
+    type            TEXT NOT NULL CHECK(type IN ('auto','manual','pattern','decision')),
+    content         TEXT NOT NULL,
+    git_diff        TEXT,
+    created_at      TEXT NOT NULL,
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TEXT,
+    status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'cold')),
+    scope           TEXT NOT NULL DEFAULT 'project' CHECK(scope IN ('project', 'global'))
 );
 
 -- FTS5 virtual table with porter stemmer for English search
@@ -34,9 +45,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 );
 
 -- Triggers to keep FTS index in sync.
--- IMPORTANT: Any direct UPDATE to memories.title or memories.content in db.rs
--- must go through these triggers — bypassing them (e.g. raw execute without UPDATE)
--- would leave the FTS index out of sync. Always use the trigger-covered UPDATE path.
+-- IMPORTANT: Any direct INSERT, UPDATE, or DELETE on memories.title/content that bypasses
+-- normal single-statement DML (e.g. execute_batch with multiple statements) would skip
+-- these triggers and leave the FTS index out of sync. Always use single-statement DML.
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, title, content)
     VALUES (new.rowid, new.title, new.content);
@@ -54,6 +65,15 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     VALUES (new.rowid, new.title, new.content);
 END;
 
--- Index for project-scoped queries
-CREATE INDEX IF NOT EXISTS memories_project_idx ON memories(project, created_at DESC);
-CREATE INDEX IF NOT EXISTS sessions_project_idx ON sessions(project, started_at DESC);
+-- Project-scoped queries
+CREATE INDEX IF NOT EXISTS memories_project_idx   ON memories(project, created_at DESC);
+CREATE INDEX IF NOT EXISTS sessions_project_idx   ON sessions(project, started_at DESC);
+
+-- run_decay (reduces scan set for status filter), recent_memories no-project ORDER BY
+CREATE INDEX IF NOT EXISTS memories_status_created_idx ON memories(status, created_at DESC);
+
+-- recent_auto_memories WHERE type='auto'
+CREATE INDEX IF NOT EXISTS memories_type_created_idx   ON memories(type, created_at DESC);
+
+-- OR scope='global' join in search/context queries
+CREATE INDEX IF NOT EXISTS memories_scope_idx          ON memories(scope);
