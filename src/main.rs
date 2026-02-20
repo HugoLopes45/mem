@@ -137,6 +137,12 @@ enum Commands {
 
     /// Show session analytics: tokens, cache efficiency, top projects
     Gain,
+
+    /// Hard-delete a memory by ID (irreversible)
+    Delete {
+        /// Memory ID to delete
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -170,6 +176,7 @@ fn main() -> Result<()> {
         Commands::Demote { id } => cmd_demote(db_path, id),
         Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
         Commands::Gain => cmd_gain(db_path),
+        Commands::Delete { id } => cmd_delete(db_path, id),
     }
 }
 
@@ -361,6 +368,16 @@ fn cmd_demote(db_path: PathBuf, id: String) -> Result<()> {
     let db = Db::open(&db_path)?;
     if db.demote_memory(&id)? {
         println!("Memory {id} demoted to project scope.");
+        Ok(())
+    } else {
+        anyhow::bail!("No memory found with id: {id}")
+    }
+}
+
+fn cmd_delete(db_path: PathBuf, id: String) -> Result<()> {
+    let db = Db::open(&db_path)?;
+    if db.delete_memory(&id)? {
+        println!("Deleted memory {id}.");
         Ok(())
     } else {
         anyhow::bail!("No memory found with id: {id}")

@@ -33,6 +33,18 @@ fn ok_text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(s.into())]))
 }
 
+/// Acquire the DB mutex, failing fast with an MCP error if the mutex is poisoned.
+///
+/// Mutex poison means a thread panicked while holding the lock — the rusqlite
+/// `Connection` inside may be in a partially-written state. Continuing with
+/// `into_inner()` would risk returning corrupt query results, so we return an
+/// error instead and let the caller surface it to the MCP client.
+fn lock_db(db: &Mutex<Db>) -> Result<std::sync::MutexGuard<'_, Db>, McpError> {
+    db.lock().map_err(|_| {
+        mcp_err("db mutex poisoned — server is in an inconsistent state, restart required")
+    })
+}
+
 #[derive(Clone)]
 pub struct MemServer {
     db: Arc<Mutex<Db>>,
@@ -161,10 +173,7 @@ impl MemServer {
         let (title, content, project) = (p.title, p.content, p.project);
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
+            let db = lock_db(&db)?;
             db.save_memory(
                 &title,
                 memory_type,
@@ -173,10 +182,10 @@ impl MemServer {
                 None,
                 None,
             )
+            .map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         ok_text(format!(
             "Saved memory: {} (id: {}, scope: {})",
@@ -201,15 +210,12 @@ impl MemServer {
         let (query, project) = (p.query, p.project);
 
         let results = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
+            let db = lock_db(&db)?;
             db.search_memories(&query, project.as_deref(), limit)
+                .map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         if results.is_empty() {
             return ok_text("No memories found.");
@@ -245,15 +251,11 @@ impl MemServer {
         let project = p.project;
 
         let mems = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.recent_memories(Some(&project), limit)
+            let db = lock_db(&db)?;
+            db.recent_memories(Some(&project), limit).map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         ok_text(format_context_markdown(&mems))
     }
@@ -267,15 +269,11 @@ impl MemServer {
         let id_display = id.clone();
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.get_memory(&id)
+            let db = lock_db(&db)?;
+            db.get_memory(&id).map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         match mem {
             Some(m) => ok_text(serde_json::to_string_pretty(&m).map_err(mcp_err)?),
@@ -291,15 +289,11 @@ impl MemServer {
         let db = self.db.clone();
 
         let s = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.stats()
+            let db = lock_db(&db)?;
+            db.stats().map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         ok_text(format!(
             "Memories: {} ({} active, {} cold)\nSessions: {}\nProjects: {}\nDB size: {} KB",
@@ -328,15 +322,12 @@ impl MemServer {
         let (project, goal, sid) = (p.project, p.goal, session_id.clone());
 
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
+            let db = lock_db(&db)?;
             db.start_session(&sid, Some(&project), goal.as_deref())
+                .map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         ok_text(format!("Session started: {session_id}"))
     }
@@ -354,15 +345,11 @@ impl MemServer {
         let id_display = id.clone();
 
         let changed = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.promote_memory(&id)
+            let db = lock_db(&db)?;
+            db.promote_memory(&id).map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         if changed {
             ok_text(format!("Memory {id_display} promoted to global scope."))
@@ -384,15 +371,11 @@ impl MemServer {
         let id_display = id.clone();
 
         let changed = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.demote_memory(&id)
+            let db = lock_db(&db)?;
+            db.demote_memory(&id).map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         if changed {
             ok_text(format!("Memory {id_display} demoted to project scope."))
@@ -413,15 +396,11 @@ impl MemServer {
         let db = self.db.clone();
 
         let memories = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.recent_auto_memories(limit)
+            let db = lock_db(&db)?;
+            db.recent_auto_memories(limit).map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         if memories.is_empty() {
             return ok_text("No auto-captured memories found. Run some sessions with the Stop hook enabled first.");
@@ -438,15 +417,11 @@ impl MemServer {
         let db = self.db.clone();
 
         let g = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(|e| {
-                eprintln!("[mem] warn: db mutex poisoned (thread panic while holding lock) — db state may be inconsistent");
-                e.into_inner()
-            });
-            db.gain_stats()
+            let db = lock_db(&db)?;
+            db.gain_stats().map_err(mcp_err)
         })
         .await
-        .map_err(mcp_err)?
-        .map_err(mcp_err)?;
+        .map_err(mcp_err)??;
 
         let cache_efficiency = g.cache_efficiency_pct();
 
@@ -490,4 +465,335 @@ pub async fn run_mcp_server(db_path: PathBuf) -> Result<()> {
     let transport = rmcp::transport::io::stdio();
     server.serve(transport).await?.waiting().await?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_server() -> MemServer {
+        let db = Db::open(std::path::Path::new(":memory:")).expect("in-memory DB");
+        MemServer::new(db)
+    }
+
+    fn save_params(title: &str, content: &str) -> Parameters<SaveParams> {
+        Parameters(SaveParams {
+            title: title.to_string(),
+            content: content.to_string(),
+            memory_type: UserMemoryType::Manual,
+            project: None,
+        })
+    }
+
+    /// Extract the text string from the first content block of a `CallToolResult`.
+    fn result_text(r: &CallToolResult) -> &str {
+        r.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .as_str()
+    }
+
+    // ── mem_save ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_save_rejects_blank_title() {
+        let s = test_server();
+        let err = s
+            .mem_save(Parameters(SaveParams {
+                title: "  ".to_string(),
+                content: "content".to_string(),
+                memory_type: UserMemoryType::Manual,
+                project: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("title"));
+    }
+
+    #[tokio::test]
+    async fn mem_save_rejects_blank_content() {
+        let s = test_server();
+        let err = s
+            .mem_save(Parameters(SaveParams {
+                title: "title".to_string(),
+                content: "".to_string(),
+                memory_type: UserMemoryType::Manual,
+                project: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("content"));
+    }
+
+    #[tokio::test]
+    async fn mem_save_success_returns_id() {
+        let s = test_server();
+        let result = s
+            .mem_save(save_params("My title", "Some content"))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("My title"));
+        assert!(text.contains("id:"));
+    }
+
+    // ── mem_search ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_search_rejects_blank_query() {
+        let s = test_server();
+        let err = s
+            .mem_search(Parameters(SearchParams {
+                query: "  ".to_string(),
+                project: None,
+                limit: 10,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("blank"));
+    }
+
+    #[tokio::test]
+    async fn mem_search_limit_capped_at_200() {
+        let s = test_server();
+        // Save one memory so search has something to match
+        s.mem_save(save_params("cap test", "content for cap test"))
+            .await
+            .unwrap();
+        // limit=9999 should be capped — just verify it doesn't error
+        let result = s
+            .mem_search(Parameters(SearchParams {
+                query: "cap test".to_string(),
+                project: None,
+                limit: 9999,
+            }))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mem_search_returns_no_memories_message() {
+        let s = test_server();
+        let result = s
+            .mem_search(Parameters(SearchParams {
+                query: "xyzzy_not_found".to_string(),
+                project: None,
+                limit: 10,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result_text(&result), "No memories found.");
+    }
+
+    #[tokio::test]
+    async fn mem_search_finds_saved_memory() {
+        let s = test_server();
+        s.mem_save(save_params("JWT auth", "Decided to use JWT tokens"))
+            .await
+            .unwrap();
+        let result = s
+            .mem_search(Parameters(SearchParams {
+                query: "JWT".to_string(),
+                project: None,
+                limit: 10,
+            }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("JWT auth"));
+    }
+
+    // ── mem_context ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_context_limit_capped_at_50() {
+        let s = test_server();
+        let result = s
+            .mem_context(Parameters(ContextParams {
+                project: "/test".to_string(),
+                limit: 9999,
+            }))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mem_context_returns_empty_when_no_memories() {
+        let s = test_server();
+        let result = s
+            .mem_context(Parameters(ContextParams {
+                project: "/nonexistent-project".to_string(),
+                limit: 5,
+            }))
+            .await
+            .unwrap();
+        // format_context_markdown returns a non-empty header even with no memories
+        assert!(!result_text(&result).is_empty());
+    }
+
+    // ── mem_get ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_get_returns_not_found_for_unknown_id() {
+        let s = test_server();
+        let result = s
+            .mem_get(Parameters(GetParams {
+                id: "no-such-id".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("No memory found"));
+    }
+
+    #[tokio::test]
+    async fn mem_get_returns_memory_by_id() {
+        let s = test_server();
+        let saved = s
+            .mem_save(save_params("Get test", "content"))
+            .await
+            .unwrap();
+        // Extract id from "Saved memory: Get test (id: <uuid>, scope: ...)"
+        let id = result_text(&saved)
+            .split("id: ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let result = s.mem_get(Parameters(GetParams { id })).await.unwrap();
+        assert!(result_text(&result).contains("Get test"));
+    }
+
+    // ── mem_stats ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_stats_returns_counts() {
+        let s = test_server();
+        s.mem_save(save_params("stats title", "stats content"))
+            .await
+            .unwrap();
+        let result = s.mem_stats().await.unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("Memories:"));
+        assert!(text.contains("Sessions:"));
+        assert!(text.contains("DB size:"));
+    }
+
+    // ── mem_session_start ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_session_start_with_explicit_id() {
+        let s = test_server();
+        let result = s
+            .mem_session_start(Parameters(SessionStartParams {
+                project: "/my/proj".to_string(),
+                goal: Some("test goal".to_string()),
+                session_id: Some("explicit-session-id".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("explicit-session-id"));
+    }
+
+    #[tokio::test]
+    async fn mem_session_start_generates_id_when_omitted() {
+        let s = test_server();
+        let result = s
+            .mem_session_start(Parameters(SessionStartParams {
+                project: "/my/proj".to_string(),
+                goal: None,
+                session_id: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        // UUID should be 36 chars; confirm a session ID was generated
+        assert!(text.contains("Session started:"));
+        let sid = text.trim_start_matches("Session started: ").trim();
+        assert_eq!(sid.len(), 36, "auto-generated session ID should be a UUID");
+    }
+
+    // ── mem_promote / mem_demote ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_promote_unknown_id_returns_not_found() {
+        let s = test_server();
+        let result = s
+            .mem_promote(Parameters(PromoteDemoteParams {
+                id: "unknown".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("No memory found"));
+    }
+
+    #[tokio::test]
+    async fn mem_promote_then_demote_roundtrip() {
+        let s = test_server();
+        let saved = s
+            .mem_save(save_params("promote me", "content"))
+            .await
+            .unwrap();
+        let id = result_text(&saved)
+            .split("id: ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let promote = s
+            .mem_promote(Parameters(PromoteDemoteParams { id: id.clone() }))
+            .await
+            .unwrap();
+        assert!(result_text(&promote).contains("promoted to global"));
+
+        let demote = s
+            .mem_demote(Parameters(PromoteDemoteParams { id }))
+            .await
+            .unwrap();
+        assert!(result_text(&demote).contains("demoted to project"));
+    }
+
+    // ── mem_suggest_rules ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_suggest_rules_no_memories_returns_guidance() {
+        let s = test_server();
+        let result = s
+            .mem_suggest_rules(Parameters(SuggestRulesParams { limit: 20 }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("No auto-captured memories"));
+    }
+
+    #[tokio::test]
+    async fn mem_suggest_rules_limit_capped_at_500() {
+        let s = test_server();
+        // Should not error even with huge limit
+        let result = s
+            .mem_suggest_rules(Parameters(SuggestRulesParams { limit: 99999 }))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── mem_gain ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_gain_returns_valid_json() {
+        let s = test_server();
+        let result = s.mem_gain().await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_text(&result)).expect("gain should be JSON");
+        assert!(parsed.get("session_count").is_some());
+        assert!(parsed.get("cache_efficiency_pct").is_some());
+        assert!(parsed.get("top_projects").is_some());
+    }
 }

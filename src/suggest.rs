@@ -23,20 +23,40 @@ const STOP_WORDS: &[&str] = &[
     "out", "up", "end", "been", "about", "more", "some", "such", "them", "they",
     // Domain noise: auto-capture boilerplate terms
     "session", "git", "ended", "changes", "detected", "captured", "utc", "project", "repo", "mem",
-    "memory", "context", "2026", "00", "date", "time",
+    "memory", "context", "00", "date", "time",
 ];
 
-/// Tokenize a string into lowercase words >= 3 chars, filtering stop-words.
-fn tokenize(text: &str) -> Vec<String> {
+/// Returns true if the token is a 4-digit calendar year (2000–2099).
+///
+/// Hardcoding specific years like "2026" is a time-bomb — this predicate
+/// covers the entire plausible range and never needs updating.
+fn is_year_token(tok: &str) -> bool {
+    if tok.len() != 4 {
+        return false;
+    }
+    tok.starts_with("20") && tok.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Split text into lowercase tokens of length >= 3, preserving underscores and hyphens.
+/// Does NOT filter stop-words — callers that need stop-word filtering use `tokenize`.
+fn split_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
         .filter_map(|tok| {
             let lower = tok.to_lowercase();
-            if lower.len() >= 3 && !STOP_WORDS.contains(&lower.as_str()) {
+            if lower.len() >= 3 {
                 Some(lower)
             } else {
                 None
             }
         })
+        .collect()
+}
+
+/// Tokenize a string into lowercase words >= 3 chars, filtering stop-words and year tokens.
+fn tokenize(text: &str) -> Vec<String> {
+    split_tokens(text)
+        .into_iter()
+        .filter(|tok| !STOP_WORDS.contains(&tok.as_str()) && !is_year_token(tok))
         .collect()
 }
 
@@ -73,17 +93,7 @@ pub fn suggest_rules(memories: &[Memory]) -> String {
         let combined = format!("{} {}", mem.title, mem.content);
         // Bigrams computed on the raw (pre-filter) token list, then checked that both
         // constituent tokens survive stop-word filtering before the bigram is emitted.
-        let raw_tokens: Vec<String> = combined
-            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-            .filter_map(|tok| {
-                let lower = tok.to_lowercase();
-                if lower.len() >= 3 {
-                    Some(lower)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let raw_tokens = split_tokens(&combined);
         let tokens = tokenize(&combined);
         let token_set: std::collections::HashSet<&str> =
             tokens.iter().map(|t| t.as_str()).collect();

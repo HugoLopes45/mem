@@ -198,33 +198,34 @@ impl Db {
             return;
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 \
-             WHERE id IN ({placeholders})"
-        );
-        let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-        for id in ids {
-            all_params.push(Box::new(id.clone()));
-        }
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        // Use a transaction + per-ID update instead of dynamic IN(?,?,?) SQL.
+        // This avoids string-building, stays within rusqlite's safe param API,
+        // and is equally fast for typical batch sizes (< 200 rows).
+        let result = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            for id in ids {
+                tx.execute(
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2",
+                    params![now, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
         // In `mem mcp` mode, stderr is observed by the MCP client (stdio transport).
         // The "[mem]" prefix lets clients filter these warnings. Access tracking
         // failures are non-fatal — they do not affect query results.
-        match self.conn.prepare(&sql) {
-            Err(e) => eprintln!("[mem] warn: access tracking prepare failed: {e}"),
-            Ok(mut stmt) => {
-                if let Err(e) = stmt.execute(params_refs.as_slice()) {
-                    eprintln!("[mem] warn: batch access tracking failed: {e}");
-                }
-            }
+        if let Err(e) = result {
+            eprintln!("[mem] warn: batch access tracking failed: {e}");
         }
+    }
+
+    /// Hard-delete a memory by ID. Returns true if a row was deleted.
+    pub fn delete_memory(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        Ok(n > 0)
     }
 
     /// Run Ebbinghaus decay: mark memories below retention threshold as 'cold'.

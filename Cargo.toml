@@ -1,6 +1,6 @@
 [package]
 name = "mem"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Persistent memory for Claude Code — zero-config session capture via hooks, SQLite + FTS5, MCP server"
 license = "MIT"
