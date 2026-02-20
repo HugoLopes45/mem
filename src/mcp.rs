@@ -1,13 +1,9 @@
 use anyhow::Result;
-use rmcp::{
-    ErrorData as McpError,
-    ServerHandler,
-    handler::server::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::*,
-    tool, tool_handler, tool_router,
-};
 use rmcp::schemars::JsonSchema;
+use rmcp::{
+    handler::server::tool::ToolRouter, handler::server::wrapper::Parameters, model::*, tool,
+    tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,7 +13,11 @@ use crate::db::Db;
 use crate::types::{MemoryType, UserMemoryType};
 
 fn mcp_err(msg: impl std::fmt::Display) -> McpError {
-    McpError::new(rmcp::model::ErrorCode::INTERNAL_ERROR, msg.to_string(), None)
+    McpError::new(
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        msg.to_string(),
+        None,
+    )
 }
 
 fn ok_text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
@@ -70,7 +70,9 @@ struct SearchParams {
     limit: u32,
 }
 
-fn default_limit() -> u32 { 10 }
+fn default_limit() -> u32 {
+    10
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct ContextParams {
@@ -81,7 +83,9 @@ struct ContextParams {
     limit: u32,
 }
 
-fn default_context_limit() -> u32 { 5 }
+fn default_context_limit() -> u32 {
+    5
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct GetParams {
@@ -111,7 +115,9 @@ impl MemServer {
     }
 
     /// Save a memory manually. Use for important decisions, patterns, or findings.
-    #[tool(description = "Save a memory manually. Use for important decisions, patterns, or findings you want to preserve across sessions.")]
+    #[tool(
+        description = "Save a memory manually. Use for important decisions, patterns, or findings you want to preserve across sessions."
+    )]
     async fn mem_save(&self, params: Parameters<SaveParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let memory_type: MemoryType = p.memory_type.into();
@@ -119,57 +125,89 @@ impl MemServer {
         let (title, content, project) = (p.title, p.content, p.project);
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
-            db.save_memory(&title, memory_type, &content, project.as_deref(), None, None)
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            db.save_memory(
+                &title,
+                memory_type,
+                &content,
+                project.as_deref(),
+                None,
+                None,
+            )
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         ok_text(format!("Saved memory: {} (id: {})", mem.title, mem.id))
     }
 
     /// Full-text search memories using FTS5 with porter stemming.
-    #[tool(description = "Search memories using full-text search. Input is treated as a phrase search — no FTS5 syntax required. Results ordered by relevance.")]
-    async fn mem_search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Search memories using full-text search. Input is treated as a phrase search — no FTS5 syntax required. Results ordered by relevance."
+    )]
+    async fn mem_search(
+        &self,
+        params: Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let limit = (p.limit as usize).min(200);
         let db = self.db.clone();
         let (query, project) = (p.query, p.project);
 
         let results = tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
             db.search_memories(&query, project.as_deref(), limit)
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         if results.is_empty() {
             return ok_text("No memories found.");
         }
 
-        let out = results.iter().map(|m| {
-            format!("**{}** ({})\n{}\n---", m.title, m.created_at.format("%Y-%m-%d"), m.content)
-        }).collect::<Vec<_>>().join("\n");
+        let out = results
+            .iter()
+            .map(|m| {
+                format!(
+                    "**{}** ({})\n{}\n---",
+                    m.title,
+                    m.created_at.format("%Y-%m-%d"),
+                    m.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         ok_text(out)
     }
 
     /// Get recent memories for a project — for loading context at session start.
-    #[tool(description = "Get recent memories for a project. Returns last N session summaries as context. Use at session start to restore prior context.")]
-    async fn mem_context(&self, params: Parameters<ContextParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Get recent memories for a project. Returns last N session summaries as context. Use at session start to restore prior context."
+    )]
+    async fn mem_context(
+        &self,
+        params: Parameters<ContextParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let limit = (p.limit as usize).min(50);
         let db = self.db.clone();
         let project = p.project;
 
         let mems = tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
             db.recent_memories(Some(&project), limit)
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         ok_text(format_context_markdown(&mems))
     }
@@ -183,54 +221,71 @@ impl MemServer {
         let id_display = id.clone();
 
         let mem = tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
             db.get_memory(&id)
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         match mem {
-            Some(m) => ok_text(serde_json::to_string_pretty(&m).map_err(|e| mcp_err(e))?),
+            Some(m) => ok_text(serde_json::to_string_pretty(&m).map_err(mcp_err)?),
             None => ok_text(format!("No memory found with id: {id_display}")),
         }
     }
 
     /// Database statistics — memory count, sessions, projects, DB size.
-    #[tool(description = "Show database statistics: total memories, sessions, projects tracked, and DB size on disk.")]
+    #[tool(
+        description = "Show database statistics: total memories, sessions, projects tracked, and DB size on disk."
+    )]
     async fn mem_stats(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.clone();
 
         let s = tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
             db.stats()
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         ok_text(format!(
             "Memories: {}\nSessions: {}\nProjects: {}\nDB size: {} KB",
-            s.memory_count, s.session_count, s.project_count,
+            s.memory_count,
+            s.session_count,
+            s.project_count,
             s.db_size_bytes / 1024,
         ))
     }
 
     /// Register a session start — tracks project and optional goal.
-    #[tool(description = "Register the start of a Claude Code session. Records project and goal for context. Use $CLAUDE_SESSION_ID for session_id.")]
-    async fn mem_session_start(&self, params: Parameters<SessionStartParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Register the start of a Claude Code session. Records project and goal for context. Use $CLAUDE_SESSION_ID for session_id."
+    )]
+    async fn mem_session_start(
+        &self,
+        params: Parameters<SessionStartParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let session_id = p.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = p
+            .session_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let db = self.db.clone();
         let (project, goal, sid) = (p.project, p.goal, session_id.clone());
 
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
             db.start_session(&sid, Some(&project), goal.as_deref())
         })
         .await
-        .map_err(|e| mcp_err(e))?
-        .map_err(|e| mcp_err(e))?;
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
 
         ok_text(format!("Session started: {session_id}"))
     }

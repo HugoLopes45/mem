@@ -52,16 +52,13 @@ impl std::str::FromStr for MemoryType {
 
 /// A `MemoryType` that only accepts user-settable values (not `auto`).
 /// Used in MCP `SaveParams` to prevent agents from setting the auto-capture type.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Default, Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum UserMemoryType {
+    #[default]
     Manual,
     Pattern,
     Decision,
-}
-
-impl Default for UserMemoryType {
-    fn default() -> Self { UserMemoryType::Manual }
 }
 
 impl From<UserMemoryType> for MemoryType {

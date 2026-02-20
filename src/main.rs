@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
-use auto::{AutoCapture, format_context_markdown};
+use auto::{format_context_markdown, AutoCapture};
 use db::Db;
 use types::{CompactContextOutput, MemoryType};
 
@@ -104,23 +104,31 @@ fn main() -> Result<()> {
     let db_path = cli.db;
 
     match cli.command {
-        Commands::Mcp => {
-            tokio::runtime::Runtime::new()?
-                .block_on(mcp::run_mcp_server(db_path))
-        }
-        Commands::Save { auto, project, title, content, memory_type } => {
+        Commands::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::run_mcp_server(db_path)),
+        Commands::Save {
+            auto,
+            project,
+            title,
+            content,
+            memory_type,
+        } => {
             if auto {
                 cmd_save_auto(db_path, project)
             } else {
                 cmd_save_manual(db_path, title, content, memory_type, project)
             }
         }
-        Commands::Context { project, limit, compact, out } => {
-            cmd_context(db_path, project, limit, compact, out)
-        }
-        Commands::Search { query, project, limit } => {
-            cmd_search(db_path, query, project, limit)
-        }
+        Commands::Context {
+            project,
+            limit,
+            compact,
+            out,
+        } => cmd_context(db_path, project, limit, compact, out),
+        Commands::Search {
+            query,
+            project,
+            limit,
+        } => cmd_search(db_path, query, project, limit),
         Commands::Stats => cmd_stats(db_path),
         Commands::Tui => tui::run_tui(db_path),
     }
@@ -152,7 +160,8 @@ fn cmd_save_manual(
     let title = title.context("--title required for manual save")?;
     let content = content.context("--content required for manual save")?;
     let mt: MemoryType = memory_type.parse()?;
-    let project_str = project.as_deref()
+    let project_str = project
+        .as_deref()
         .and_then(|p| auto::git_repo_root(p).or_else(|| p.to_str().map(String::from)));
 
     let db = Db::open(&db_path)?;
@@ -177,14 +186,13 @@ fn cmd_context(
                 None
             } else {
                 let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)
+                std::io::stdin()
+                    .read_to_string(&mut buf)
                     .context("reading hook stdin for cwd")?;
                 let hook: types::HookStdin = serde_json::from_str(&buf).unwrap_or_default();
-                hook.cwd.as_deref()
-                    .and_then(|cwd| {
-                        auto::git_repo_root(std::path::Path::new(cwd))
-                            .or_else(|| Some(cwd.to_string()))
-                    })
+                hook.cwd.as_deref().and_then(|cwd| {
+                    auto::git_repo_root(std::path::Path::new(cwd)).or_else(|| Some(cwd.to_string()))
+                })
             }
         }
     };
@@ -194,7 +202,9 @@ fn cmd_context(
     let markdown = format_context_markdown(&mems);
 
     if compact {
-        let output = CompactContextOutput { additional_context: markdown };
+        let output = CompactContextOutput {
+            additional_context: markdown,
+        };
         println!("{}", serde_json::to_string(&output)?);
     } else if let Some(path) = out {
         std::fs::write(&path, &markdown)
@@ -205,7 +215,12 @@ fn cmd_context(
     Ok(())
 }
 
-fn cmd_search(db_path: PathBuf, query: String, project: Option<String>, limit: usize) -> Result<()> {
+fn cmd_search(
+    db_path: PathBuf,
+    query: String,
+    project: Option<String>,
+    limit: usize,
+) -> Result<()> {
     let db = Db::open(&db_path)?;
     let results = db.search_memories(&query, project.as_deref(), limit)?;
 

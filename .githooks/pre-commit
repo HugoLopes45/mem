@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce rustfmt + clippy before every commit.
+# Install once: git config core.hooksPath .githooks
+set -euo pipefail
+
+# Only run when Rust source files are staged
+if ! git diff --cached --name-only | grep -qE '\.rs$'; then
+    exit 0
+fi
+
+echo "[pre-commit] cargo fmt --check"
+if ! cargo fmt -- --check; then
+    echo ""
+    echo "  Formatting issues found. Run: cargo fmt"
+    exit 1
+fi
+
+echo "[pre-commit] cargo clippy"
+if ! cargo clippy -- -D warnings 2>&1; then
+    echo ""
+    echo "  Clippy errors found. Fix them before committing."
+    exit 1
+fi
+
+echo "[pre-commit] OK"

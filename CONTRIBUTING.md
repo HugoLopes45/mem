@@ -5,6 +5,7 @@
 ```bash
 git clone https://github.com/HugoLopes45/mem
 cd mem
+git config core.hooksPath .githooks   # enforces fmt + clippy on commit
 cargo build
 cargo test
 ```
