@@ -1,16 +1,29 @@
-# mem
+# mem — persistent memory for Claude Code
 
-**Persistent memory for Claude Code.** Auto-captures session summaries at session end via hooks — no agent cooperation required.
+[![CI](https://github.com/YOUR_ORG/mem/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_ORG/mem/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/mem.svg)](https://crates.io/crates/mem)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**`mem` gives Claude Code a persistent memory that survives session ends, context compaction, and restarts — with zero agent cooperation.**
+
+It hooks into Claude Code's `Stop`, `PreCompact`, and `SessionStart` events to automatically capture and restore session context. No `mem_save` calls. No setup per-project. Just install and wire the hooks once.
 
 ```
-Session ends → git diff captured → SQLite entry written → next session loads context automatically
+$ echo '{"cwd":"/your/project","session_id":"abc"}' | mem save --auto
+[mem] saved: your-project: 3 files changed, 142 insertions(+) (d4f1a3…)
+
+$ mem search "auth middleware"
+[auto] your-project: added JWT auth middleware (2026-02-19)
+  Switched from session cookies to JWT. Expiry: 24h. Refresh: 7d.
 ```
 
-## The problem
+---
 
-Claude Code agents forget everything when a session ends. Most memory solutions (engram, mem_save) require the agent to remember to save — three failure points, most sessions end without any memory saved.
+## Why
 
-`mem` uses Claude Code hooks that fire reliably at session boundaries. Zero agent involvement.
+Claude Code agents forget everything when a session ends. The usual fix — calling `mem_save` manually — has three failure points: the agent must decide what to save, remember to call it, and remember to call `mem_context` at the next start. Most sessions end without any memory saved.
+
+`mem` uses Claude Code hooks that fire **reliably at session boundaries**. The infrastructure captures memory. The agent never has to think about it.
 
 ## Install
 
@@ -18,15 +31,56 @@ Claude Code agents forget everything when a session ends. Most memory solutions 
 cargo install --git https://github.com/YOUR_ORG/mem
 ```
 
-Or clone and build:
+No system dependencies. SQLite is statically linked — `cargo install` is all you need.
+
+<details>
+<summary>Build from source</summary>
 
 ```bash
 git clone https://github.com/YOUR_ORG/mem
 cd mem
-cargo install --path .
+cargo build --release
+# binary at: ./target/release/mem
 ```
 
-**No system dependencies.** SQLite is statically linked (`rusqlite --bundled`). Works on macOS and Linux.
+Requires Rust 1.75+.
+</details>
+
+## Quick start
+
+**1. Install `mem`**
+
+```bash
+cargo install --git https://github.com/YOUR_ORG/mem
+```
+
+**2. Copy hook scripts to a stable location**
+
+```bash
+cp /path/to/mem/hooks/* ~/.claude/hooks/
+chmod +x ~/.claude/hooks/mem-*.sh
+```
+
+**3. Add to `~/.claude/settings.json`**
+
+```json
+{
+  "hooks": {
+    "Stop": [{
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-stop.sh"}]
+    }],
+    "PreCompact": [{
+      "matcher": "auto",
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-precompact.sh"}]
+    }],
+    "SessionStart": [{
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/mem-session-start.sh"}]
+    }]
+  }
+}
+```
+
+**4. Done.** Every session end is now captured automatically.
 
 ## How it works
 
@@ -34,171 +88,130 @@ cargo install --path .
 Claude Code session
   │
   ├─ SessionStart hook
-  │     → writes .mem-context.md (last 3 session summaries)
-  │     → @-include in project CLAUDE.md for auto-injection
+  │     → writes .mem-context.md to project root (last 3 sessions)
+  │     → @-include in CLAUDE.md for auto-injection into every session
   │
   ├─ [session runs — agent can also call MCP tools explicitly]
   │
   ├─ PreCompact hook
-  │     → outputs {"additionalContext": "..."} JSON
-  │     → recent memories survive context window compaction
+  │     → outputs {"additionalContext": "..."} JSON to stdout
+  │     → Claude Code injects this into post-compaction context
+  │     → recent memories survive the context window limit
   │
   └─ Stop hook
-        → reads git diff --stat, session metadata from stdin
+        → reads hook stdin JSON (cwd, session_id)
+        → runs git diff --stat HEAD
         → writes structured summary to ~/.mem/mem.db
-        → no agent involvement needed
+        → no agent involvement
 ```
 
-## Hook configuration
-
-Copy the hook scripts from `hooks/` to a stable location, then add to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "Stop": [{
-      "hooks": [{
-        "type": "command",
-        "command": "/path/to/hooks/mem-stop.sh"
-      }]
-    }],
-    "PreCompact": [{
-      "matcher": "auto",
-      "hooks": [{
-        "type": "command",
-        "command": "/path/to/hooks/mem-precompact.sh"
-      }]
-    }],
-    "SessionStart": [{
-      "hooks": [{
-        "type": "command",
-        "command": "/path/to/hooks/mem-session-start.sh"
-      }]
-    }]
-  }
-}
-```
+Storage: `~/.mem/mem.db` — single SQLite file, WAL mode, FTS5 full-text search with porter stemming.
 
 ## MCP server
 
-For explicit agent memory control, `mem` also runs as an MCP server. Add to `~/.claude/settings.json`:
+`mem` also runs as a Model Context Protocol (MCP) server so agents can explicitly search or save memories.
+
+Add to `~/.claude/settings.json` or a project `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "mem": {
-      "command": "mem",
-      "args": ["mcp"]
-    }
+    "mem": {"command": "mem", "args": ["mcp"]}
   }
 }
 ```
 
-**Available tools:** `mem_save`, `mem_search`, `mem_context`, `mem_get`, `mem_stats`, `mem_session_start`
+**6 tools:**
 
-## CLI reference
+| Tool | Purpose |
+|------|---------|
+| `mem_save` | Save a memory manually (decision, pattern, finding) |
+| `mem_search` | Full-text search with FTS5 query syntax |
+| `mem_context` | Load last N memories for a project |
+| `mem_get` | Fetch a memory by ID |
+| `mem_stats` | Database statistics |
+| `mem_session_start` | Register session start with optional goal |
+
+## CLI
 
 ```bash
-# Check what's been captured
+# What's been captured
 mem stats
-mem search "auth middleware"
-mem search "database schema" --project /path/to/project --limit 20
+mem search "database migration"
+mem search "auth" --project /path/to/project --limit 20
 
 # Manual save
 mem save \
-  --title "Switched from sqlx to rusqlite" \
-  --content "sqlx adds 3s to subprocess startup; rusqlite sync is 40ms" \
-  --memory-type decision \
-  --project /path/to/project
+  --title "Chose rusqlite over sqlx" \
+  --content "sqlx adds 3s subprocess startup; rusqlite sync = 40ms" \
+  --memory-type decision
 
-# Simulate hooks (for testing)
-echo '{"cwd":"/your/project","session_id":"abc123"}' | mem save --auto
+# Test your hook setup
+echo '{"cwd":"/your/project"}' | mem save --auto
 echo '{"cwd":"/your/project"}' | mem context --compact
 
-# Interactive TUI (coming in v0.2)
-mem tui
+# Verify DB directly
+sqlite3 ~/.mem/mem.db \
+  "SELECT title, type, created_at FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ## Project context injection
 
-At SessionStart, `mem-session-start.sh` writes `.mem-context.md` to your project root containing the last 3 session summaries. Reference it from your project `CLAUDE.md`:
+`mem-session-start.sh` writes `.mem-context.md` to your project root at each session start. Reference it from your project `CLAUDE.md`:
 
 ```markdown
 @.mem-context.md
 ```
 
-Add to your project `.gitignore`:
+Add to `.gitignore`:
 
 ```
 .mem-context.md
 ```
 
-## Storage
+Now every new Claude Code session opens with the last 3 session summaries already in context.
 
-| Setting | Default | Override |
-|---------|---------|----------|
-| Database | `~/.mem/mem.db` | `MEM_DB=/custom/path.db` |
-| Format | SQLite WAL + FTS5 | — |
-| Search | Porter stemmer | — |
+## Configuration
 
-## Verification
-
-```bash
-# Build
-cargo build --release && ./target/release/mem stats
-
-# Simulate Stop hook
-echo '{"cwd":"/tmp/test-project"}' | ./target/release/mem save --auto
-
-# Check DB
-sqlite3 ~/.mem/mem.db \
-  "SELECT title, type, created_at FROM memories ORDER BY created_at DESC LIMIT 5;"
-
-# Simulate PreCompact (must output valid JSON)
-echo '{"cwd":"/tmp/test-project"}' | ./target/release/mem context --compact
-
-# MCP handshake
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}\n' \
-  | ./target/release/mem mcp
-```
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `MEM_DB` | `~/.mem/mem.db` | Custom database path |
+| `MEM_BIN` | `mem` | Custom binary path (for hook scripts) |
 
 ## Architecture
 
 ```
 src/
-  main.rs        # clap CLI: mcp | save | context | search | stats | tui
-  types.rs       # Memory, MemoryType, HookStdin, CompactContextOutput
-  db.rs          # rusqlite: open, save, search (FTS5), recent, stats
-  auto.rs        # Auto-capture: parse hook stdin + git diff --stat
-  mcp.rs         # rmcp 0.16: 6 MCP tools over stdio
-  tui.rs         # ratatui interactive search (v0.2)
+  main.rs        CLI — subcommands: mcp, save, context, search, stats, tui
+  types.rs       Shared types: Memory, MemoryType, HookStdin, CompactContextOutput
+  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries
+  auto.rs        Auto-capture — hook stdin parsing, git diff, title generation
+  mcp.rs         MCP server — rmcp 0.16, 6 tools, stdio transport
+  tui.rs         Interactive TUI — ratatui (v0.2)
 migrations/
-  001_init.sql   # memories + FTS5 + triggers + sessions
+  001_init.sql   Schema: memories + FTS5 triggers + sessions
 hooks/
-  mem-stop.sh           # Stop hook wrapper
-  mem-precompact.sh     # PreCompact hook wrapper
-  mem-session-start.sh  # SessionStart hook wrapper
+  mem-stop.sh           Stop hook wrapper
+  mem-precompact.sh     PreCompact hook wrapper
+  mem-session-start.sh  SessionStart hook wrapper
 ```
 
-**Key dependencies:**
-- [`rusqlite`](https://crates.io/crates/rusqlite) — sync SQLite, bundled, FTS5
-- [`rmcp`](https://crates.io/crates/rmcp) — official Rust MCP SDK
-- [`clap`](https://crates.io/crates/clap) — CLI
-- [`ratatui`](https://crates.io/crates/ratatui) — TUI (v0.2)
+**Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap) · [`ratatui`](https://crates.io/crates/ratatui) (v0.2 TUI)
 
-## vs. engram
+## vs. alternatives
 
-| | engram | mem |
-|--|--------|-----|
-| Memory capture | Agent must call save | **Automatic via Stop hook** |
-| Context on compaction | Agent must call | **Automatic via PreCompact hook** |
-| Context on start | Agent must call | **Automatic via SessionStart hook** |
-| System deps | None | None (bundled SQLite) |
-| Install | brew / binary | `cargo install` |
+| | engram | mem_save | **mem** |
+|--|--------|----------|---------|
+| Capture trigger | Agent call | Agent call | **Hook (automatic)** |
+| Survives compaction | No | No | **Yes (PreCompact hook)** |
+| Context on start | Agent call | Agent call | **Automatic (SessionStart)** |
+| System deps | None | None | **None (bundled SQLite)** |
+| Search | — | — | **FTS5 + porter stemmer** |
+| MCP tools | Plugin | Manual | **6 built-in tools** |
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome.
 
 ## License
 
