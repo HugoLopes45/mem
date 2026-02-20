@@ -17,6 +17,7 @@ pub struct Memory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryType {
+    /// Captured automatically by the Stop hook — not user-settable via MCP
     Auto,
     Manual,
     Pattern,
@@ -42,12 +43,37 @@ impl std::str::FromStr for MemoryType {
             "manual" => Ok(MemoryType::Manual),
             "pattern" => Ok(MemoryType::Pattern),
             "decision" => Ok(MemoryType::Decision),
-            other => Err(anyhow::anyhow!("unknown memory type: {other}")),
+            other => Err(anyhow::anyhow!(
+                "unknown memory type: '{other}'. Valid values: manual, pattern, decision"
+            )),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// A `MemoryType` that only accepts user-settable values (not `auto`).
+/// Used in MCP `SaveParams` to prevent agents from setting the auto-capture type.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserMemoryType {
+    Manual,
+    Pattern,
+    Decision,
+}
+
+impl Default for UserMemoryType {
+    fn default() -> Self { UserMemoryType::Manual }
+}
+
+impl From<UserMemoryType> for MemoryType {
+    fn from(u: UserMemoryType) -> Self {
+        match u {
+            UserMemoryType::Manual => MemoryType::Manual,
+            UserMemoryType::Pattern => MemoryType::Pattern,
+            UserMemoryType::Decision => MemoryType::Decision,
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct Session {
     pub id: String,
@@ -58,14 +84,17 @@ pub struct Session {
     pub turn_count: i64,
 }
 
-/// Output from `mem context --compact` — Claude Code PreCompact hook format
+/// Output from `mem context --compact` — matches Claude Code PreCompact hook protocol.
+// Not serialized beyond this specific use — do not add fields.
 #[derive(Debug, Serialize)]
 pub struct CompactContextOutput {
     #[serde(rename = "additionalContext")]
     pub additional_context: String,
 }
 
-/// Hook stdin JSON — common fields across hook types
+/// Common fields from Claude Code hook stdin JSON.
+// Uses Default so malformed stdin falls back gracefully rather than hard-failing.
+// See auto.rs for why that tradeoff is intentional.
 #[derive(Debug, Deserialize, Default)]
 pub struct HookStdin {
     pub cwd: Option<String>,
@@ -73,10 +102,12 @@ pub struct HookStdin {
     pub stop_hook_active: Option<bool>,
 }
 
+// Not serialized — formatted manually in cmd_stats. Adding Serialize here would
+// risk accidentally exposing this internal type through a future API.
 #[derive(Debug)]
 pub struct DbStats {
-    pub memory_count: i64,
-    pub session_count: i64,
-    pub project_count: i64,
+    pub memory_count: u64,
+    pub session_count: u64,
+    pub project_count: u64,
     pub db_size_bytes: u64,
 }

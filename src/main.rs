@@ -6,7 +6,7 @@ mod types;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use auto::{AutoCapture, format_context_markdown};
@@ -80,7 +80,7 @@ enum Commands {
 
     /// Full-text search memories
     Search {
-        /// Search query (FTS5 syntax)
+        /// Search query
         query: String,
 
         /// Filter by project
@@ -105,11 +105,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Mcp => {
-            // MCP server is async — spin up tokio runtime
             tokio::runtime::Runtime::new()?
                 .block_on(mcp::run_mcp_server(db_path))
         }
-
         Commands::Save { auto, project, title, content, memory_type } => {
             if auto {
                 cmd_save_auto(db_path, project)
@@ -117,17 +115,13 @@ fn main() -> Result<()> {
                 cmd_save_manual(db_path, title, content, memory_type, project)
             }
         }
-
         Commands::Context { project, limit, compact, out } => {
             cmd_context(db_path, project, limit, compact, out)
         }
-
         Commands::Search { query, project, limit } => {
             cmd_search(db_path, query, project, limit)
         }
-
         Commands::Stats => cmd_stats(db_path),
-
         Commands::Tui => tui::run_tui(db_path),
     }
 }
@@ -138,19 +132,13 @@ fn cmd_save_auto(db_path: PathBuf, project_override: Option<PathBuf>) -> Result<
     let mut stdin_buf = String::new();
     std::io::stdin().read_to_string(&mut stdin_buf)?;
 
-    let capture = AutoCapture::from_stdin(
-        &stdin_buf,
-        project_override.as_deref(),
-    )?;
-
-    let Some(capture) = capture else {
-        // stop_hook_active=true — bail silently to avoid infinite loop
+    let Some(capture) = AutoCapture::from_stdin(&stdin_buf, project_override.as_deref())? else {
+        // stop_hook_active=true — bail to avoid infinite loop
         return Ok(());
     };
 
     let db = Db::open(&db_path)?;
-    let mem = capture.capture_and_save(&db)?;
-    eprintln!("[mem] saved: {} ({})", mem.title, mem.id);
+    let _mem = capture.capture_and_save(&db)?;
     Ok(())
 }
 
@@ -180,21 +168,23 @@ fn cmd_context(
     compact: bool,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    // If no project given, try reading from stdin (hook payload)
     let project_str = match project {
-        Some(p) => auto::git_repo_root(&p)
-            .or_else(|| p.to_str().map(String::from)),
+        Some(p) => auto::git_repo_root(&p).or_else(|| p.to_str().map(String::from)),
         None => {
-            let mut buf = String::new();
-            // Non-blocking stdin check — hooks pipe JSON to us
-            if atty::is(atty::Stream::Stdin) {
+            // In hook context, cwd is provided via stdin JSON.
+            // IsTerminal check prevents blocking on stdin in interactive use.
+            if std::io::stdin().is_terminal() {
                 None
             } else {
-                std::io::stdin().read_to_string(&mut buf).ok();
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)
+                    .context("reading hook stdin for cwd")?;
                 let hook: types::HookStdin = serde_json::from_str(&buf).unwrap_or_default();
                 hook.cwd.as_deref()
-                    .and_then(|cwd| auto::git_repo_root(std::path::Path::new(cwd))
-                        .or_else(|| Some(cwd.to_string())))
+                    .and_then(|cwd| {
+                        auto::git_repo_root(std::path::Path::new(cwd))
+                            .or_else(|| Some(cwd.to_string()))
+                    })
             }
         }
     };
@@ -204,13 +194,11 @@ fn cmd_context(
     let markdown = format_context_markdown(&mems);
 
     if compact {
-        // PreCompact hook format
         let output = CompactContextOutput { additional_context: markdown };
         println!("{}", serde_json::to_string(&output)?);
     } else if let Some(path) = out {
         std::fs::write(&path, &markdown)
             .with_context(|| format!("write context to {}", path.display()))?;
-        eprintln!("[mem] context written to {}", path.display());
     } else {
         print!("{markdown}");
     }
@@ -239,9 +227,8 @@ fn cmd_search(db_path: PathBuf, query: String, project: Option<String>, limit: u
 }
 
 fn cmd_stats(db_path: PathBuf) -> Result<()> {
-    // If DB doesn't exist yet, show friendly message
     if !db_path.exists() {
-        println!("No memory database yet. Run a session with Stop hook configured.");
+        println!("No memory database yet. Run a session with the Stop hook configured.");
         return Ok(());
     }
     let db = Db::open(&db_path)?;

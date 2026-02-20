@@ -40,7 +40,6 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 dirs = "6"
-atty = "0.2"
 
 [profile.release]
 opt-level = "z"

@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::types::{HookStdin, Memory, MemoryType};
 use crate::db::Db;
+use crate::types::{HookStdin, Memory, MemoryType};
 
 pub struct AutoCapture {
     pub project: PathBuf,
@@ -11,12 +11,22 @@ pub struct AutoCapture {
 }
 
 impl AutoCapture {
-    /// Read hook stdin JSON and resolve project path.
-    /// Returns None if stop_hook_active=true (prevent infinite loop).
+    /// Parse hook stdin JSON and resolve project path.
+    /// Returns `None` if `stop_hook_active=true` (prevents infinite loop when
+    /// `mem save --auto` itself triggers the Stop hook).
     pub fn from_stdin(stdin_json: &str, override_project: Option<&Path>) -> Result<Option<Self>> {
-        let hook: HookStdin = serde_json::from_str(stdin_json).unwrap_or_default();
+        let hook: HookStdin = match serde_json::from_str(stdin_json) {
+            Ok(h) => h,
+            Err(e) => {
+                // Log parse failure to stderr — Stop hooks don't block on stderr content,
+                // so this is visible in `claude --debug` without affecting hook exit code.
+                eprintln!("[mem] warn: failed to parse hook stdin JSON: {e}");
+                HookStdin::default()
+            }
+        };
 
-        // Guard: if Stop hook triggered by our own mem save, bail
+        // Guard: Stop hook fires again when `mem save --auto` itself runs as a subprocess.
+        // Claude Code sets stop_hook_active=true in that inner invocation.
         if hook.stop_hook_active == Some(true) {
             return Ok(None);
         }
@@ -26,16 +36,14 @@ impl AutoCapture {
         } else if let Some(cwd) = hook.cwd {
             PathBuf::from(cwd)
         } else {
+            eprintln!("[mem] warn: no cwd in hook stdin, falling back to process working directory");
             std::env::current_dir()?
         };
 
-        Ok(Some(Self {
-            project,
-            session_id: hook.session_id,
-        }))
+        Ok(Some(Self { project, session_id: hook.session_id }))
     }
 
-    /// Capture what happened this session and write to DB.
+    /// Capture what changed this session and write to DB.
     pub fn capture_and_save(&self, db: &Db) -> Result<Memory> {
         let git_diff = self.git_diff_stat();
         let title = self.build_title(&git_diff);
@@ -44,9 +52,11 @@ impl AutoCapture {
         let project_str = git_repo_root(&self.project)
             .unwrap_or_else(|| self.project.to_string_lossy().to_string());
 
-        // Mark session as ended
+        // Mark session as ended — non-fatal if it fails (session row may not exist)
         if let Some(ref sid) = self.session_id {
-            let _ = db.end_session(sid);
+            if let Err(e) = db.end_session(sid) {
+                eprintln!("[mem] warn: end_session failed for {sid}: {e}");
+            }
         }
 
         db.save_memory(
@@ -60,6 +70,7 @@ impl AutoCapture {
     }
 
     fn git_diff_stat(&self) -> Option<String> {
+        // `.ok()?` is intentional: no git repo is an expected, non-error condition
         let output = Command::new("git")
             .args(["-C", &self.project.to_string_lossy(), "diff", "--stat", "HEAD"])
             .output()
@@ -79,11 +90,11 @@ impl AutoCapture {
             .unwrap_or_else(|| "unknown".to_string());
 
         if let Some(diff) = git_diff {
-            // Extract file count from "3 files changed" summary line
-            let files: Vec<&str> = diff.lines()
+            // Extract the summary line: "3 files changed, 142 insertions(+)"
+            if let Some(summary) = diff.lines()
                 .filter(|l| l.contains("file") && l.contains("changed"))
-                .collect();
-            if let Some(summary) = files.last() {
+                .last()
+            {
                 return format!("{project_name}: {}", summary.trim());
             }
         }
@@ -91,13 +102,11 @@ impl AutoCapture {
     }
 
     fn build_content(&self, git_diff: &Option<String>) -> String {
-        let mut parts = vec![];
-
-        parts.push(format!(
+        let mut parts = vec![format!(
             "Project: {}\nCaptured: {}",
             self.project.display(),
             chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
-        ));
+        )];
 
         if let Some(diff) = git_diff {
             parts.push(format!("## Git Changes\n```\n{diff}\n```"));
@@ -109,8 +118,9 @@ impl AutoCapture {
     }
 }
 
-/// Resolve the git repo root for a path (for stable project identity across subdirs).
+/// Resolve the git repo root — for stable project identity across subdirectories.
 pub fn git_repo_root(path: &Path) -> Option<String> {
+    // `.ok()?` is intentional: not a git repo is an expected, non-error condition
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
@@ -124,7 +134,7 @@ pub fn git_repo_root(path: &Path) -> Option<String> {
 }
 
 /// Format recent memories as markdown for context injection.
-pub fn format_context_markdown(memories: &[crate::types::Memory]) -> String {
+pub fn format_context_markdown(memories: &[Memory]) -> String {
     if memories.is_empty() {
         return String::from("No recent memories for this project.");
     }
@@ -132,7 +142,13 @@ pub fn format_context_markdown(memories: &[crate::types::Memory]) -> String {
     let mut out = String::from("# Recent Session Memory\n\n");
     for (i, m) in memories.iter().enumerate() {
         let ts = m.created_at.format("%Y-%m-%d %H:%M UTC");
-        out.push_str(&format!("## {} — {} ({})\n\n{}\n\n", i + 1, m.title, ts, m.content));
+        out.push_str(&format!(
+            "## {} — {} ({})\n\n{}\n\n",
+            i + 1,
+            m.title,
+            ts,
+            m.content
+        ));
     }
     out
 }
