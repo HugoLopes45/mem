@@ -1,0 +1,42 @@
+[package]
+name = "mem"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent memory for Claude Code — auto-capture via hooks, MCP tools, FTS5 search"
+license = "MIT"
+
+[[bin]]
+name = "mem"
+path = "src/main.rs"
+
+[dependencies]
+# MCP server — official Rust SDK
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
+schemars = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Storage — sync, simple, fast subprocess startup
+# "bundled" = statically links SQLite (zero system dep)
+# "vtab" = enables virtual table support including FTS5
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# TUI (week 2)
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+dirs = "6"
+atty = "0.2"
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
