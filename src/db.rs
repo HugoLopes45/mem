@@ -336,7 +336,7 @@ impl Db {
         id: &str,
         analytics: &TranscriptAnalytics,
     ) -> Result<()> {
-        self.conn.execute(
+        let rows = self.conn.execute(
             "UPDATE sessions SET
                  turn_count = ?1,
                  duration_secs = ?2,
@@ -355,6 +355,9 @@ impl Db {
                 id
             ],
         )?;
+        if rows == 0 {
+            eprintln!("[mem] warn: session_id {id} not found — analytics not stored");
+        }
         Ok(())
     }
 
@@ -421,7 +424,7 @@ impl Db {
 
     /// Aggregate token/time analytics across all sessions.
     pub fn gain_stats(&self) -> Result<GainStats> {
-        let row = self.conn.query_row(
+        let aggregate = self.conn.query_row(
             "SELECT
                  COUNT(*) as session_count,
                  COALESCE(SUM(duration_secs), 0) as total_secs,
@@ -434,16 +437,17 @@ impl Db {
              FROM sessions",
             [],
             |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, f64>(6)?,
-                    r.get::<_, f64>(7)?,
-                ))
+                Ok(GainStats {
+                    session_count: r.get(0)?,
+                    total_secs: r.get(1)?,
+                    total_input: r.get(2)?,
+                    total_output: r.get(3)?,
+                    total_cache_read: r.get(4)?,
+                    total_cache_creation: r.get(5)?,
+                    avg_turns: r.get(6)?,
+                    avg_secs: r.get(7)?,
+                    top_projects: Vec::new(),
+                })
             },
         )?;
 
@@ -464,19 +468,12 @@ impl Db {
                     total_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                 })
             })?
-            .map(|r| r.map_err(anyhow::Error::from))
+            .map(|r| r.map_err(Into::into))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(GainStats {
-            session_count: row.0,
-            total_secs: row.1,
-            total_input: row.2,
-            total_output: row.3,
-            total_cache_read: row.4,
-            total_cache_creation: row.5,
-            avg_turns: row.6,
-            avg_secs: row.7,
             top_projects,
+            ..aggregate
         })
     }
 
@@ -1386,5 +1383,93 @@ mod tests {
         let db = in_memory_db();
         let result = db.demote_memory("nonexistent-id-xyz").unwrap();
         assert!(!result, "demote should return false for nonexistent ID");
+    }
+
+    // ── Session analytics write-read round-trip ───────────────────────────────
+
+    #[test]
+    fn update_session_analytics_persists_and_gain_stats_reads_back() {
+        use crate::types::TranscriptAnalytics;
+
+        let db = in_memory_db();
+        db.start_session("sess-analytics", Some("/proj-a"), None)
+            .unwrap();
+
+        let analytics = TranscriptAnalytics {
+            turn_count: 7,
+            duration_secs: 300,
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read_tokens: 200,
+            cache_creation_tokens: 50,
+        };
+        db.update_session_analytics("sess-analytics", &analytics)
+            .unwrap();
+
+        let g = db.gain_stats().unwrap();
+        assert_eq!(g.session_count, 1);
+        assert_eq!(g.total_input, 1000);
+        assert_eq!(g.total_output, 500);
+        assert_eq!(g.total_cache_read, 200);
+        assert_eq!(g.total_cache_creation, 50);
+        assert_eq!(g.total_secs, 300);
+        assert_eq!(g.avg_turns, 7.0);
+    }
+
+    #[test]
+    fn gain_stats_aggregates_multiple_sessions() {
+        use crate::types::TranscriptAnalytics;
+
+        let db = in_memory_db();
+        for (id, proj) in [("s1", "/a"), ("s2", "/b"), ("s3", "/a")] {
+            db.start_session(id, Some(proj), None).unwrap();
+            db.update_session_analytics(
+                id,
+                &TranscriptAnalytics {
+                    turn_count: 4,
+                    duration_secs: 120,
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_tokens: 30,
+                    cache_creation_tokens: 10,
+                },
+            )
+            .unwrap();
+        }
+
+        let g = db.gain_stats().unwrap();
+        assert_eq!(g.session_count, 3);
+        assert_eq!(g.total_input, 300);
+        assert_eq!(g.total_output, 150);
+        assert_eq!(g.total_cache_read, 90);
+        assert_eq!(g.total_secs, 360);
+        assert_eq!(g.avg_turns, 4.0);
+        // top_projects: /a has 2 sessions, /b has 1
+        assert!(!g.top_projects.is_empty());
+        assert_eq!(g.top_projects[0].project, "/a");
+        assert_eq!(g.top_projects[0].sessions, 2);
+    }
+
+    #[test]
+    fn update_session_analytics_missing_session_id_is_no_op() {
+        use crate::types::TranscriptAnalytics;
+
+        let db = in_memory_db();
+        // No session created — should complete without error (warning goes to stderr)
+        let result = db.update_session_analytics(
+            "nonexistent-session",
+            &TranscriptAnalytics {
+                turn_count: 3,
+                duration_secs: 60,
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 20,
+                cache_creation_tokens: 5,
+            },
+        );
+        assert!(result.is_ok(), "missing session_id must not return Err");
+        // No sessions exist, so gain_stats shows 0
+        let g = db.gain_stats().unwrap();
+        assert_eq!(g.session_count, 0);
     }
 }
