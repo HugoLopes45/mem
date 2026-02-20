@@ -1,66 +1,66 @@
-# mem — persistent memory for Claude Code
+# mem — session memory for Claude Code
 
 [![CI](https://github.com/HugoLopes45/mem/actions/workflows/ci.yml/badge.svg)](https://github.com/HugoLopes45/mem/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/mem.svg)](https://crates.io/crates/mem)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**`mem` gives Claude Code a persistent memory that survives session ends, context compaction, and restarts — with zero agent cooperation.**
+Claude forgets everything between sessions. `mem` fixes that in two steps:
 
-It hooks into Claude Code's `Stop`, `PreCompact`, and `SessionStart` events to automatically capture and restore session context. No `mem_save` calls. No setup per-project. Just install once.
+1. **Teaches Claude to maintain `MEMORY.md`** — adds a rule to `~/.claude/CLAUDE.md` so Claude updates the file at the end of every session with decisions, rejections, and patterns.
+2. **Injects `MEMORY.md` at session start** — wires a `SessionStart` hook so Claude opens every session with full project context already in mind.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HugoLopes45/mem/main/install.sh | bash
+```
+
+That's it. One command, zero manual config.
+
+---
+
+## How it works
 
 ```
-$ mem search "auth middleware"
-[auto] your-project: added JWT auth middleware (2026-02-19)
-  Switched from session cookies to JWT. Expiry: 24h. Refresh: 7d.
-  3 files changed, 142 insertions(+)
+mem init
+  → adds rule to ~/.claude/CLAUDE.md   (Claude writes MEMORY.md at session end)
+  → wires SessionStart hook             (MEMORY.md injected at session start)
+
+Every session:
+  start  → mem session-start injects MEMORY.md into Claude's context
+  end    → Claude updates MEMORY.md per the rule (decisions, rejections, patterns)
+```
+
+The file lives at your project root. Claude reads it, Claude maintains it.
+
+---
+
+## Commands
+
+```bash
+mem init              # setup: wire hook + add rule to CLAUDE.md
+mem status            # verify: hook installed? rule present? files indexed?
+mem index             # index all MEMORY.md files for search
+mem search <query>    # search across all indexed MEMORY.md files
 ```
 
 ---
 
-## The problem you already have
+## What goes in MEMORY.md
 
-You spend 90 minutes with Claude Code. You nail the architecture, make key decisions, figure out why the database connection pool needs a 30s timeout. Session ends.
+Claude writes this automatically. Example after a few sessions:
 
-Next day, you open a new session. **Claude remembers nothing.** You spend the first 20 minutes re-explaining context — what the project does, what you decided yesterday, what you already tried. Then you hit context limit. Compaction wipes the rest.
+```markdown
+# myproject
 
-This is not a small annoyance. It is death by a thousand re-explanations.
-
-### Why existing tools don't fix it
-
-Every memory tool for Claude Code has the same fatal flaw: **the agent has to do it.**
-
-The agent must decide what's worth saving. Remember to call `mem_save`. Load memory at the next session start. Under load, at the end of a long session, after context compaction — agents don't. Humans don't either.
-
-> **Most sessions end without any memory saved. That's not a bug in your workflow. It's the design.**
-
-`mem` removes the agent from the equation entirely. Claude Code's own hooks fire at session boundaries — reliably, automatically, whether the agent cooperates or not. The infrastructure captures memory. You never lose context again.
-
-```
-$ mem status
-Binary   : /Users/you/.cargo/bin/mem
-Hooks    : installed
-
-Database : ~/.mem/mem.db
-Memories : 47 (44 active, 3 cold)
-Sessions : 31
-Projects : 6
-DB size  : 128 KB
-Last cap : 2026-02-20 18:42 UTC
-
-Analytics: Cache efficiency 73.2%, avg 12 turns/session
+- Auth: JWT, not sessions — mobile client needs stateless (2026-02-18)
+- Tried Prisma, switched to raw SQL — too much magic for this schema
+- Don't use `any` — Biome enforces strict types, CI will fail
+- Payment webhooks must be idempotent — Stripe retries on timeout
+- DB migrations: always add column nullable first, backfill, then add constraint
 ```
 
-### What you get back
+Decisions, rejections, patterns. Things Claude would otherwise ask about again.
 
-- **Session continuity** — every new session opens with project MEMORY.md + last 3 session summaries already in context
-- **Compaction survival** — PreCompact hook injects MEMORY.md + recent memories *before* the window is truncated
-- **Zero overhead** — no `mem_save` calls, no per-project setup, no agent discipline required
-- **Full-text search** — FTS5 + porter stemming across everything ever captured, including MEMORY.md files
-- **Cross-project MEMORY.md index** — `mem index` indexes all `~/.claude/projects/*/memory/MEMORY.md` files; search finds lessons across every project instantly
-- **Memory decay** — Ebbinghaus-style scoring automatically archives stale memories; accessed ones stay sharp
-- **Cross-project memory** — promote a pattern to global scope; it appears in every project's context
-- **CLAUDE.md suggestions** — `mem suggest-rules` analyses your sessions and outputs rules ready to paste
-- **Session analytics** — `mem gain` shows token usage, cache efficiency, and top projects
+---
 
 ## Install
 
@@ -68,12 +68,8 @@ Analytics: Cache efficiency 73.2%, avg 12 turns/session
 curl -fsSL https://raw.githubusercontent.com/HugoLopes45/mem/main/install.sh | bash
 ```
 
-One command. Installs the binary and wires all three Claude Code hooks automatically via `mem init`. No JSON editing, no manual hook setup.
-
-No system dependencies — SQLite is statically linked.
-
 <details>
-<summary>Install from source (Rust toolchain required)</summary>
+<summary>From source</summary>
 
 ```bash
 cargo install --git https://github.com/HugoLopes45/mem --locked
@@ -83,229 +79,32 @@ mem init
 Requires Rust 1.75+.
 </details>
 
-<details>
-<summary>Build from source</summary>
+---
+
+## Verify
 
 ```bash
-git clone https://github.com/HugoLopes45/mem
-cd mem
-cargo build --release
-./target/release/mem init
+mem status
 ```
 
-</details>
+```
+Binary    : /Users/you/.cargo/bin/mem
+Hook      : installed
+Rule      : installed
+Indexed   : 3 MEMORY.md file(s)
+```
 
-## Quick start
+---
 
-**1. Install and wire**
+## Search across projects
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HugoLopes45/mem/main/install.sh | bash
+mem index                    # index all MEMORY.md files
+mem search "jwt"             # find decisions across all projects
+mem search "rejected"        # find things you decided not to do
 ```
 
-**2. Done.** Every session is now captured automatically.
-
-```bash
-mem status   # verify hooks are installed
-mem gain     # token analytics after a few sessions
-```
-
-## How it works
-
-Three hooks. Zero agent involvement.
-
-```
-Claude Code session
-  │
-  ├─ SessionStart hook  ← fires before Claude sees anything
-  │     → runs: mem session-start
-  │     → reads project MEMORY.md + global ~/.claude/MEMORY.md
-  │     → loads last 3 session summaries from ~/.mem/mem.db
-  │     → outputs {"systemMessage":"..."} — injected directly into Claude's context
-  │     → Claude opens with full context, zero file boilerplate
-  │
-  ├─ [session runs — agent works normally]
-  │     → agent can also call MCP tools explicitly (mem_search, mem_save…)
-  │
-  ├─ PreCompact hook  ← fires before context window is truncated
-  │     → runs: mem context --compact
-  │     → injects project MEMORY.md + recent memories as {"additionalContext": "..."}
-  │     → Claude Code merges this into post-compaction context
-  │     → nothing is lost when the window fills up
-  │
-  └─ Stop hook  ← fires when session ends, with or without agent cooperation
-        → runs: mem auto
-        → parses hook stdin: cwd, session_id, transcript_path
-        → captures git log (committed work) + git diff --stat
-        → parses transcript for token usage, turn counts, and Claude's last message
-        → title uses Claude's own session summary as priority 1
-        → writes structured memory to ~/.mem/mem.db
-        → no agent call required, no agent discipline required
-```
-
-Storage: `~/.mem/mem.db` — single SQLite file, WAL mode, FTS5 full-text search with porter stemming.
-
-## Memory lifecycle
-
-Every memory has a **scope** (project or global) and a **status** (active or cold).
-
-Hard deletion is also available when you want to permanently remove a memory:
-
-```bash
-mem delete <id>   # irreversible — removes the row entirely
-```
-
-For soft archival (keeps the row, excludes it from results), use `mem decay` instead.
-
-**Scope** controls visibility:
-- `project` (default) — only visible when searching within that project
-- `global` — visible across all projects; use for cross-cutting rules and conventions
-
-**Status** tracks freshness via Ebbinghaus-style decay:
-- `active` — returned in search and context queries
-- `cold` — archived; excluded from results but not deleted
-
-The retention score formula used by `mem decay` is:
-
-```
-retention = (access_count + 1) / (1 + days_since_created × 0.05)
-```
-
-Memories that accumulate access events decay slower. Run `mem decay --dry-run` to preview what would be archived before committing.
-
-**Suggest-rules** analyses auto-captured memories for recurring terms and bigrams (pure frequency — no LLM) and outputs CLAUDE.md-ready markdown you can paste directly.
-
-## MCP server
-
-`mem` also runs as a Model Context Protocol (MCP) server so agents can explicitly search or save memories.
-
-Add to `~/.claude/settings.json` or a project `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "mem": {"command": "mem", "args": ["mcp"]}
-  }
-}
-```
-
-**10 tools:**
-
-| Tool | Purpose |
-|------|---------|
-| `mem_save` | Save a memory manually (decision, pattern, finding) |
-| `mem_search` | Full-text search with FTS5 + porter stemming; includes global memories |
-| `mem_context` | Load last N memories for a project; includes global memories |
-| `mem_get` | Fetch a memory by ID |
-| `mem_stats` | Database statistics (active/cold counts, projects, DB size) |
-| `mem_session_start` | Register session start with optional goal |
-| `mem_promote` | Promote a memory to global scope |
-| `mem_demote` | Demote a memory back to project scope |
-| `mem_suggest_rules` | Suggest CLAUDE.md rules from recurring session patterns |
-| `mem_gain` | Session analytics as JSON: tokens, cache efficiency, top projects |
-
-## CLI
-
-```bash
-# Setup
-mem init         # wire hooks into ~/.claude/settings.json (idempotent)
-mem status       # check hook install state + DB stats
-
-# What's been captured
-mem stats
-mem search "database migration"
-mem search "auth" --project /path/to/project --limit 20
-
-# Cross-project MEMORY.md index
-mem index                            # index all ~/.claude/projects/*/memory/MEMORY.md files
-mem index --dry-run                  # preview what would be indexed (new / updated / unchanged)
-mem index --path /path/to/MEMORY.md  # index a single file
-
-# search queries both auto-captured memories AND indexed MEMORY.md files
-mem search "biome non-null"          # returns results from any project's MEMORY.md
-
-# Manual save
-mem save \
-  --title "Chose rusqlite over sqlx" \
-  --content "sqlx adds 3s subprocess startup; rusqlite sync = 40ms" \
-  --memory-type decision
-
-# Memory lifecycle
-mem decay --dry-run                  # preview what would be archived
-mem decay --threshold 0.1            # archive low-retention memories
-mem delete <id>                      # hard-delete a memory (irreversible)
-mem promote <id>                     # make a memory visible across all projects
-mem demote <id>                      # return a memory to project scope
-
-# Suggest CLAUDE.md rules from session patterns
-mem suggest-rules                    # analyse last 20 auto-captured memories
-mem suggest-rules --limit 50         # analyse more sessions
-
-# Session analytics
-mem gain                             # token usage, cache efficiency, top projects by tokens
-
-# Test your hook setup
-echo '{"cwd":"/your/project"}' | mem auto
-echo '{"cwd":"/your/project"}' | mem context --compact
-echo '{"cwd":"/your/project"}' | mem session-start
-
-# Verify DB directly
-sqlite3 ~/.mem/mem.db \
-  "SELECT title, type, status, scope, created_at FROM memories ORDER BY created_at DESC LIMIT 10;"
-```
-
-## Configuration
-
-| Env var | Default | Purpose |
-|---------|---------|---------|
-| `MEM_DB` | `~/.mem/mem.db` | Custom database path |
-| `MEM_CLAUDE_DIR` | `~/.claude/projects/` | Override Claude Code projects root (used by `mem index`; also useful for tests) |
-
-## Architecture
-
-```
-src/
-  main.rs        CLI — subcommands: init, session-start, status, mcp, save, auto,
-                        context, search, stats, decay, promote, demote,
-                        suggest-rules, gain, delete, index
-  types.rs       Domain types: Memory, MemoryType, MemoryStatus, MemoryScope,
-                        IndexedFile, IndexStats, SearchResult, HookStdin,
-                        TranscriptAnalytics, GainStats, SessionStartOutput
-  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic,
-                        indexed_files upsert/search/list, unified search
-  auto.rs        Auto-capture — hook stdin parsing, transcript analytics, git diff,
-                        find_project_memory_md, MEMORY.md scanning
-  mcp.rs         MCP server — rmcp 0.16, 10 tools, stdio transport
-  suggest.rs     Rule suggestion engine — pure frequency analysis, no LLM
-migrations/
-  001_init.sql   Canonical schema: sessions + memories + FTS5 triggers + indexes
-  002_indexed_files.sql  indexed_files table + FTS5 + sync triggers
-hooks/
-  mem-stop.sh           Stop hook script (pipes stdin → mem auto)
-  mem-precompact.sh     PreCompact hook script (pipes stdin → mem context --compact)
-  mem-session-start.sh  SessionStart hook script (pipes stdin → mem session-start → JSON stdout)
-```
-
-**Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap)
-
-## Design goals
-
-| | Manual memory tools | **mem** |
-|--|---------------------|---------|
-| Capture trigger | Agent must call | **Hook — fires automatically** |
-| Survives compaction | No | **Yes — PreCompact injects MEMORY.md + recent memories** |
-| Context on start | Agent must call | **Automatic — SessionStart injects systemMessage** |
-| System deps | Varies | **None — bundled SQLite binary** |
-| Memory freshness | Never expires | **Ebbinghaus decay — accessed memories stay, stale ones archive** |
-| Cross-project memory | No | **Yes — promote any memory to global scope** |
-| Pattern extraction | Manual | **`suggest-rules` analyses sessions → CLAUDE.md rules** |
-| Search | Varies | **FTS5 + porter stemmer, full history** |
-| Cross-project MEMORY.md | No | **`mem index` + unified search across all projects** |
-| MCP tools | Varies | **10 built-in tools** |
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome.
+---
 
 ## License
 

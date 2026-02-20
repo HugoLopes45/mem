@@ -1,554 +1,130 @@
-mod auto;
-mod db;
-mod mcp;
-mod suggest;
-mod types;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use auto::{
-    find_project_memory_md, format_context_markdown, read_mtime_secs, scan_and_index_memory_files,
-    AutoCapture,
-};
-use db::Db;
-use types::{CompactContextOutput, MemoryType, SearchResult, SessionStartOutput};
-
-fn default_db_path() -> PathBuf {
-    match dirs::home_dir() {
-        Some(home) => home.join(".mem").join("mem.db"),
-        None => {
-            eprintln!("[mem] warn: $HOME not set — using /tmp/.mem/mem.db (data will not persist across reboots)");
-            PathBuf::from("/tmp").join(".mem").join("mem.db")
-        }
-    }
-}
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "mem", about = "Persistent memory for Claude Code sessions")]
+#[command(name = "mem", about = "Session memory for Claude Code")]
 struct Cli {
-    /// Path to the SQLite database
-    #[arg(long, env = "MEM_DB", default_value_os_t = default_db_path())]
-    db: PathBuf,
-
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as MCP server (stdio transport)
-    Mcp,
-
-    /// Save a memory manually (title, content, type)
-    Save {
-        /// Short title for this memory
-        #[arg(long)]
-        title: Option<String>,
-
-        /// Memory content
-        #[arg(long)]
-        content: Option<String>,
-
-        /// Memory type: manual | pattern | decision
-        #[arg(long, default_value = "manual")]
-        memory_type: String,
-
-        /// Project path override
-        #[arg(long)]
-        project: Option<PathBuf>,
-
-        /// Session ID to associate with this memory
-        #[arg(long)]
-        session_id: Option<String>,
-    },
-
-    /// Capture session memory from Stop hook stdin (called automatically by hooks)
-    Auto {
-        /// Project path override
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-
-    /// Output recent memories for context injection
-    Context {
-        /// Project path
-        #[arg(long)]
-        project: Option<PathBuf>,
-
-        /// Number of recent memories to include
-        #[arg(long, default_value_t = 3)]
-        limit: usize,
-
-        /// Output as PreCompact additionalContext JSON
-        #[arg(long)]
-        compact: bool,
-
-        /// Write output to file instead of stdout
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-
-    /// Full-text search memories
-    Search {
-        /// Search query
-        query: String,
-
-        /// Filter by project
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Max results
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-
-    /// Show database statistics
-    Stats,
-
-    /// Mark low-retention memories as cold (Ebbinghaus decay)
-    Decay {
-        /// Retention score threshold — memories below this are marked cold
-        #[arg(long, default_value_t = 0.1)]
-        threshold: f64,
-
-        /// Show what would be marked without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Promote a memory to global scope (visible across all projects)
-    Promote {
-        /// Memory ID to promote
-        id: String,
-    },
-
-    /// Demote a memory back to project scope
-    Demote {
-        /// Memory ID to demote
-        id: String,
-    },
-
-    /// Suggest CLAUDE.md rules from recurring patterns in auto-captured memories
-    SuggestRules {
-        /// Number of recent auto-captured memories to analyse
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-
-    /// Show session analytics: tokens, cache efficiency, top projects
-    Gain,
-
-    /// Hard-delete a memory by ID (irreversible)
-    Delete {
-        /// Memory ID to delete
-        id: String,
-    },
-
-    /// Index all MEMORY.md files from ~/.claude/projects/ for cross-project search
-    Index {
-        /// Index a single file instead of scanning all projects
-        #[arg(long)]
-        path: Option<PathBuf>,
-
-        /// Show what would be indexed without writing to DB
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Wire mem hooks into ~/.claude/settings.json
+    /// Wire mem into ~/.claude/settings.json and ~/.claude/CLAUDE.md
     Init,
 
-    /// Inject MEMORY.md + recent sessions at session start (called by SessionStart hook)
+    /// Inject MEMORY.md at session start (called by SessionStart hook)
     SessionStart {
-        /// Project path override
         #[arg(long)]
         project: Option<PathBuf>,
     },
 
-    /// Show hook install state and DB statistics
+    /// Show hook install state and indexed file count
     Status,
+
+    /// Index all MEMORY.md files for search
+    Index,
+
+    /// Search across indexed MEMORY.md files
+    Search { query: String },
 }
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct HookStdin {
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionStartOutput {
+    #[serde(rename = "systemMessage")]
+    pub system_message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexEntry {
+    pub project: String,
+    pub path: String,
+    pub content: String,
+    /// Unix mtime seconds — used to skip unchanged files on re-index
+    pub mtime: i64,
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let db_path = cli.db;
-
     match cli.command {
-        Commands::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::run_mcp_server(db_path)),
-        Commands::Save {
-            title,
-            content,
-            memory_type,
-            project,
-            session_id,
-        } => cmd_save_manual(db_path, title, content, memory_type, project, session_id),
-        Commands::Auto { project } => cmd_save_auto(db_path, project),
-        Commands::Context {
-            project,
-            limit,
-            compact,
-            out,
-        } => cmd_context(db_path, project, limit, compact, out),
-        Commands::Search {
-            query,
-            project,
-            limit,
-        } => cmd_search(db_path, query, project, limit),
-        Commands::Stats => cmd_stats(db_path),
-        Commands::Decay { threshold, dry_run } => cmd_decay(db_path, threshold, dry_run),
-        Commands::Promote { id } => cmd_promote(db_path, id),
-        Commands::Demote { id } => cmd_demote(db_path, id),
-        Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
-        Commands::Gain => cmd_gain(db_path),
-        Commands::Delete { id } => cmd_delete(db_path, id),
-        Commands::Index { path, dry_run } => cmd_index(db_path, path, dry_run),
         Commands::Init => cmd_init(),
-        Commands::SessionStart { project } => cmd_session_start(db_path, project),
-        Commands::Status => cmd_status(db_path),
+        Commands::SessionStart { project } => cmd_session_start(project),
+        Commands::Status => cmd_status(),
+        Commands::Index => cmd_index(),
+        Commands::Search { query } => cmd_search(query),
     }
 }
 
-// ── Command implementations ───────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-fn cmd_save_auto(db_path: PathBuf, project_override: Option<PathBuf>) -> Result<()> {
-    let mut stdin_buf = String::new();
-    std::io::stdin().read_to_string(&mut stdin_buf)?;
+const CLAUDE_MD_MARKER: &str = "## Session Memory (managed by mem)";
 
-    let Some(capture) = AutoCapture::from_stdin(&stdin_buf, project_override.as_deref())? else {
-        // stop_hook_active=true — bail to avoid infinite loop
-        return Ok(());
-    };
+const CLAUDE_MD_BLOCK: &str = "\
+## Session Memory (managed by mem)
+At the end of every session, update MEMORY.md in the project root with:
+- Decisions made and why
+- Things tried and rejected (and why)
+- Patterns or conventions discovered
+- Anything future-Claude should know to avoid repeating work
+Keep it under 30 lines. Rewrite, don't append — remove stale entries.
+";
 
-    let db = Db::open(&db_path)?;
-    let _mem = capture.capture_and_save(&db)?;
-    Ok(())
-}
+// ── init ──────────────────────────────────────────────────────────────────────
 
-fn cmd_save_manual(
-    db_path: PathBuf,
-    title: Option<String>,
-    content: Option<String>,
-    memory_type: String,
-    project: Option<PathBuf>,
-    session_id: Option<String>,
-) -> Result<()> {
-    let title = title.context("--title required for manual save")?;
-    let content = content.context("--content required for manual save")?;
-    let mt: MemoryType = memory_type.parse()?;
-    if mt == MemoryType::Auto {
-        anyhow::bail!("'auto' is reserved for Stop hook capture via `mem auto`; valid values: manual, pattern, decision");
+fn cmd_init() -> Result<()> {
+    let home = dirs::home_dir().context("$HOME not set")?;
+
+    let mut added: Vec<&str> = Vec::new();
+
+    if wire_session_start_hook(&home.join(".claude").join("settings.json"))? {
+        added.push("SessionStart hook → ~/.claude/settings.json");
     }
-    let project_str = project
-        .as_deref()
-        .and_then(|p| auto::git_repo_root(p).or_else(|| p.to_str().map(String::from)));
+    if wire_claude_md(&home.join(".claude").join("CLAUDE.md"))? {
+        added.push("Memory rule → ~/.claude/CLAUDE.md");
+    }
 
-    let db = Db::open(&db_path)?;
-    let mem = db.save_memory(
-        &title,
-        mt,
-        &content,
-        project_str.as_deref(),
-        session_id.as_deref(),
-        None,
-    )?;
-    println!("Saved: {} (id: {})", mem.title, mem.id);
-    Ok(())
-}
-
-fn cmd_context(
-    db_path: PathBuf,
-    project: Option<PathBuf>,
-    limit: usize,
-    compact: bool,
-    out: Option<PathBuf>,
-) -> Result<()> {
-    let project_str = match project {
-        Some(p) => auto::git_repo_root(&p).or_else(|| p.to_str().map(String::from)),
-        None => {
-            // In hook context, cwd is provided via stdin JSON.
-            // IsTerminal check prevents blocking on stdin in interactive use.
-            if std::io::stdin().is_terminal() {
-                None
-            } else {
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .context("reading hook stdin for cwd")?;
-                match serde_json::from_str::<types::HookStdin>(&buf) {
-                    Ok(hook) => hook.cwd.as_deref().and_then(|cwd| {
-                        auto::git_repo_root(std::path::Path::new(cwd))
-                            .or_else(|| Some(cwd.to_string()))
-                    }),
-                    Err(e) => {
-                        eprintln!("[mem] warn: failed to parse hook stdin JSON in context: {e}");
-                        None
-                    }
-                }
-            }
+    if added.is_empty() {
+        println!("mem already configured.");
+    } else {
+        for item in &added {
+            println!("Added {item}");
         }
-    };
-
-    let db = Db::open(&db_path)?;
-    let mems = db.recent_memories(project_str.as_deref(), limit)?;
-    let markdown = format_context_markdown(&mems);
-
-    if compact {
-        let memory_md = project_str
-            .as_deref()
-            .and_then(|p| find_project_memory_md(Path::new(p)))
-            .map(|(c, _)| format!("# Project Memory\n\n{c}"));
-
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(md) = memory_md {
-            parts.push(md);
-        }
-        if !mems.is_empty() {
-            parts.push(markdown);
-        }
-        let combined = parts.join("\n\n---\n\n");
-
-        let output = CompactContextOutput {
-            additional_context: combined,
-        };
-        println!("{}", serde_json::to_string(&output)?);
-    } else if let Some(path) = out {
-        std::fs::write(&path, &markdown)
-            .with_context(|| format!("write context to {}", path.display()))?;
-    } else {
-        print!("{markdown}");
+        println!();
+        println!("Done. Claude will maintain MEMORY.md in each project root.");
+        println!("Run `mem index` after your first session to enable search.");
     }
     Ok(())
 }
 
-fn cmd_search(
-    db_path: PathBuf,
-    query: String,
-    project: Option<String>,
-    limit: usize,
-) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    let results = db.search_unified(&query, project.as_deref(), limit)?;
-
-    if results.is_empty() {
-        println!("No memories found for: {query}");
-        return Ok(());
-    }
-
-    for r in &results {
-        match r {
-            SearchResult::Memory(m) => {
-                println!(
-                    "[{}] {} ({}) [{}]\n  {}\n",
-                    m.memory_type,
-                    m.title,
-                    m.created_at.format("%Y-%m-%d"),
-                    m.scope,
-                    m.content.lines().next().unwrap_or(""),
-                );
-            }
-            SearchResult::IndexedFile(f) => {
-                println!(
-                    "[MEMORY.md: {}] {}\n  {}\n",
-                    f.project_name,
-                    f.title,
-                    f.content.lines().next().unwrap_or(""),
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cmd_stats(db_path: PathBuf) -> Result<()> {
-    if !db_path.exists() {
-        println!("No memory database yet. Run a session with the Stop hook configured.");
-        return Ok(());
-    }
-    let db = Db::open(&db_path)?;
-    let s = db.stats()?;
-    println!(
-        "Memories : {} ({} active, {} cold)",
-        s.memory_count, s.active_count, s.cold_count
-    );
-    println!("Sessions : {}", s.session_count);
-    println!("Projects : {}", s.project_count);
-    println!("DB size  : {} KB", s.db_size_bytes / 1024);
-    println!("DB path  : {}", db_path.display());
-
-    // Session analytics summary
-    match db.gain_stats() {
-        Ok(g) if g.session_count > 0 => {
-            println!();
-            println!("Session Analytics");
-            println!(
-                "Total time : {}   Cache efficiency : {:.1}%   Avg turns : {:.1}",
-                format_duration(g.total_secs),
-                g.cache_efficiency_pct(),
-                g.avg_turns
-            );
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("[mem] warn: could not load session analytics: {e}"),
-    }
-
-    Ok(())
-}
-
-fn cmd_decay(db_path: PathBuf, threshold: f64, dry_run: bool) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    let count = db.run_decay(threshold, dry_run)?;
-
-    if dry_run {
-        println!(
-            "{count} memories would be marked cold (threshold: {threshold:.2}) [dry-run — no changes made]"
-        );
-    } else {
-        println!("{count} memories marked cold (threshold: {threshold:.2})");
-    }
-    Ok(())
-}
-
-fn cmd_promote(db_path: PathBuf, id: String) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    if db.promote_memory(&id)? {
-        println!("Memory {id} promoted to global scope.");
-        Ok(())
-    } else {
-        anyhow::bail!("No memory found with id: {id}")
-    }
-}
-
-fn cmd_demote(db_path: PathBuf, id: String) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    if db.demote_memory(&id)? {
-        println!("Memory {id} demoted to project scope.");
-        Ok(())
-    } else {
-        anyhow::bail!("No memory found with id: {id}")
-    }
-}
-
-fn cmd_delete(db_path: PathBuf, id: String) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    if db.delete_memory(&id)? {
-        println!("Deleted memory {id}.");
-        Ok(())
-    } else {
-        anyhow::bail!("No memory found with id: {id}")
-    }
-}
-
-fn cmd_index(db_path: PathBuf, path: Option<PathBuf>, dry_run: bool) -> Result<()> {
-    if let Some(p) = path {
-        return cmd_index_single(db_path, p, dry_run);
-    }
-
-    let db = Db::open(&db_path)?;
-    let stats = scan_and_index_memory_files(&db, dry_run)?;
-
-    if stats.entries.is_empty() {
-        println!("No MEMORY.md files found under ~/.claude/projects/");
-        return Ok(());
-    }
-
-    let label = if dry_run { " [dry-run]" } else { "" };
-    println!("Indexed MEMORY.md files{label}:");
-    for entry in &stats.entries {
-        let indicator = match entry.status {
-            types::IndexEntryStatus::New => "+",
-            types::IndexEntryStatus::Updated => "~",
-            types::IndexEntryStatus::Unchanged => "=",
-            types::IndexEntryStatus::Skipped => "-",
-        };
-        println!(
-            "  {indicator} {} ({} lines)",
-            entry.project_name, entry.line_count
-        );
-    }
-
-    println!();
-    if dry_run {
-        println!(
-            "{} new, {} updated, {} unchanged, {} skipped [dry-run]",
-            stats.new, stats.updated, stats.unchanged, stats.skipped
-        );
-    } else {
-        println!(
-            "{} new, {} updated, {} unchanged, {} skipped",
-            stats.new, stats.updated, stats.unchanged, stats.skipped
-        );
-    }
-    Ok(())
-}
-
-fn cmd_index_single(db_path: PathBuf, path: PathBuf, dry_run: bool) -> Result<()> {
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-
-    let line_count = content.lines().count();
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("MEMORY.md");
-    let title = auto::extract_title(&content, filename);
-
-    // Navigate up two levels: MEMORY.md → memory/ → project dir
-    let project_name = path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or_else(|| {
-            eprintln!(
-                "[mem] warn: cannot determine project name from path {}, using 'unknown'",
-                path.display()
-            );
-            "unknown"
-        })
-        .to_string();
-
-    let mtime = read_mtime_secs(&path);
-
-    if dry_run {
-        println!(
-            "[dry-run] would index: {} ({line_count} lines, title: {title:?})",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let db = Db::open(&db_path)?;
-    let source_path = path.to_string_lossy().to_string();
-    let outcome =
-        db.upsert_indexed_file(&source_path, None, &project_name, &title, &content, mtime)?;
-
-    let label = match outcome {
-        types::UpsertOutcome::New => "+ new",
-        types::UpsertOutcome::Updated => "~ updated",
-        types::UpsertOutcome::Unchanged => "= unchanged",
-    };
-    println!("{label}: {} ({line_count} lines)", path.display());
-    Ok(())
-}
-
-/// Applies all mem hooks into a settings.json at the given path.
-///
-/// Returns the list of hook labels that were added (empty if all already present).
-/// Returns `Err` if the current binary path cannot be resolved, `settings.json`
-/// is unreadable or contains invalid JSON, or the atomic rename fails.
-fn apply_hooks_to_settings(settings_path: &Path) -> Result<Vec<&'static str>> {
-    let bin = std::env::current_exe().context("cannot resolve current binary path")?;
-    let bin_str = bin.to_string_lossy();
+fn wire_session_start_hook(settings_path: &Path) -> Result<bool> {
+    let bin = std::env::current_exe().context("cannot resolve binary path")?;
+    let cmd = format!("{} session-start", bin.display());
 
     let raw = if settings_path.exists() {
         std::fs::read_to_string(settings_path)
             .with_context(|| format!("read {}", settings_path.display()))?
     } else {
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         "{}".to_string()
     };
+
     let mut settings: serde_json::Value =
         serde_json::from_str(&raw).context("parse settings.json")?;
 
@@ -560,826 +136,574 @@ fn apply_hooks_to_settings(settings_path: &Path) -> Result<Vec<&'static str>> {
         .as_object_mut()
         .context("hooks must be a JSON object")?;
 
-    let mut added: Vec<&'static str> = Vec::new();
+    let entry = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
 
-    // SessionStart hook
-    {
-        let cmd = format!("{bin_str} session-start");
-        let entry = hooks
-            .entry("SessionStart")
-            .or_insert_with(|| serde_json::json!([]));
-        if !hook_command_exists(entry, &cmd) {
-            entry
-                .as_array_mut()
-                .context("SessionStart hooks must be array")?
-                .push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
-            added.push("SessionStart hook");
-        }
+    if hook_command_exists(entry, &cmd) {
+        return Ok(false);
     }
 
-    // Stop hook
-    {
-        let cmd = format!("{bin_str} auto");
-        let entry = hooks.entry("Stop").or_insert_with(|| serde_json::json!([]));
-        if !hook_command_exists(entry, &cmd) {
-            entry
-                .as_array_mut()
-                .context("Stop hooks must be array")?
-                .push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
-            added.push("Stop hook");
-        }
-    }
-
-    // PreCompact/auto hook
-    {
-        let cmd = format!("{bin_str} context --compact");
-        let entry = hooks
-            .entry("PreCompact")
-            .or_insert_with(|| serde_json::json!([]));
-        if !hook_command_exists(entry, &cmd) {
-            entry
-                .as_array_mut()
-                .context("PreCompact hooks must be array")?
-                .push(
-                    serde_json::json!({"matcher": "auto", "hooks": [{"type": "command", "command": cmd}]}),
-                );
-            added.push("PreCompact hook (auto)");
-        }
-    }
-
-    // PreCompact/manual hook
-    {
-        let cmd = format!("{bin_str} context --compact");
-        let entry = hooks
-            .get_mut("PreCompact")
-            .context("PreCompact entry disappeared")?;
-        let manual_exists = entry
-            .as_array()
-            .map(|arr| {
-                arr.iter().any(|item| {
-                    item.get("matcher").and_then(|m| m.as_str()) == Some("manual")
-                        && item_has_command(item, &cmd)
-                })
-            })
-            .unwrap_or(false);
-        if !manual_exists {
-            entry
-                .as_array_mut()
-                .context("PreCompact hooks must be array")?
-                .push(
-                    serde_json::json!({"matcher": "manual", "hooks": [{"type": "command", "command": cmd}]}),
-                );
-            added.push("PreCompact hook (manual)");
-        }
-    }
-
-    if !added.is_empty() {
-        let tmp_path = settings_path.with_extension("json.tmp");
-        let serialized = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&tmp_path, &serialized)
-            .with_context(|| format!("write {}", tmp_path.display()))?;
-        if let Err(e) = std::fs::rename(&tmp_path, settings_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e).with_context(|| format!("rename tmp to {}", settings_path.display()));
-        }
-    }
-
-    Ok(added)
-}
-
-fn cmd_init() -> Result<()> {
-    let settings_path = dirs::home_dir()
-        .context("$HOME not set")?
-        .join(".claude")
-        .join("settings.json");
-
-    let added = apply_hooks_to_settings(&settings_path)?;
-
-    if added.is_empty() {
-        println!("mem hooks already configured, skipped.");
-    } else {
-        for name in &added {
-            println!("Added {name}");
-        }
-    }
-    Ok(())
-}
-
-/// Check if any hook entry in the array contains the given command string.
-fn hook_command_exists(entry: &serde_json::Value, cmd: &str) -> bool {
     entry
-        .as_array()
-        .is_some_and(|arr| arr.iter().any(|item| item_has_command(item, cmd)))
+        .as_array_mut()
+        .context("SessionStart hooks must be an array")?
+        .push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
+
+    atomic_write_json(settings_path, &settings)?;
+    Ok(true)
 }
 
-/// Check if a single hook item (object with "hooks" array) contains the command.
-fn item_has_command(item: &serde_json::Value, cmd: &str) -> bool {
-    item.get("hooks")
-        .and_then(|h| h.as_array())
-        .is_some_and(|hooks| {
-            hooks
-                .iter()
-                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(cmd))
-        })
-}
-
-fn cmd_session_start(db_path: PathBuf, project_override: Option<PathBuf>) -> Result<()> {
-    let result = (|| -> Result<String> {
-        // Read stdin for hook context
-        let cwd = if let Some(p) = project_override {
-            p
-        } else if std::io::stdin().is_terminal() {
-            std::env::current_dir()?
-        } else {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            match serde_json::from_str::<types::HookStdin>(&buf) {
-                Ok(hook) => match hook.cwd.map(PathBuf::from) {
-                    Some(p) => p,
-                    None => std::env::current_dir()?,
-                },
-                Err(e) => {
-                    eprintln!("[mem] warn: failed to parse hook stdin: {e}");
-                    std::env::current_dir()?
-                }
-            }
-        };
-
-        let project_str = auto::git_repo_root(&cwd).or_else(|| cwd.to_str().map(String::from));
-
-        let mut parts: Vec<String> = Vec::new();
-
-        // Project MEMORY.md
-        if let Some((content, _)) = find_project_memory_md(&cwd) {
-            parts.push(format!("# Project Memory\n\n{content}"));
-        }
-
-        // Global MEMORY.md (~/.claude/MEMORY.md)
-        if let Some(home) = dirs::home_dir() {
-            let global_mem = home.join(".claude").join("MEMORY.md");
-            if global_mem.exists() {
-                match std::fs::read_to_string(&global_mem) {
-                    Ok(content) if !content.trim().is_empty() => {
-                        parts.push(format!("# Global Memory\n\n{content}"));
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("[mem] warn: could not read {}: {e}", global_mem.display()),
-                }
-            }
-        }
-
-        // Last 3 recent auto-captures from DB
-        if db_path.exists() {
-            let db = Db::open(&db_path)?;
-            let recent = db.recent_memories(project_str.as_deref(), 3)?;
-            if !recent.is_empty() {
-                parts.push(format_context_markdown(&recent));
-            }
-        }
-
-        Ok(parts.join("\n\n---\n\n"))
-    })();
-
-    let system_message = match result {
-        Ok(msg) => msg,
-        Err(e) => {
-            eprintln!("[mem] error: session-start failed: {e:#}");
-            // Embed the error as a Markdown blockquote so Claude sees it in context.
-            // (HTML comments are rendered as literal text to the model, not hidden.)
-            format!("> **mem warning:** context injection failed — {e}\n> Run `mem status` to diagnose. This session starts without memory context.")
-        }
-    };
-
-    let output = SessionStartOutput { system_message };
-    // SessionStartOutput only contains a String — serialization cannot fail.
-    // Use unwrap_or_else to guarantee exit 0 even if somehow it did.
-    let json =
-        serde_json::to_string(&output).unwrap_or_else(|_| r#"{"systemMessage":""}"#.to_string());
-    println!("{json}");
-    Ok(())
-}
-
-fn cmd_status(db_path: PathBuf) -> Result<()> {
-    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mem"));
-    println!("Binary   : {}", bin.display());
-
-    // Check hook install state
-    let settings_path = dirs::home_dir()
-        .map(|h| h.join(".claude").join("settings.json"))
-        .unwrap_or_default();
-    let hooks_status = if !settings_path.exists() {
-        "NOT installed — run `mem init`"
+fn wire_claude_md(path: &Path) -> Result<bool> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
     } else {
-        match std::fs::read_to_string(&settings_path) {
-            Err(e) => {
-                eprintln!("[mem] warn: cannot read {}: {e}", settings_path.display());
-                "unknown — settings.json unreadable"
-            }
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Err(e) => {
-                    eprintln!("[mem] warn: cannot parse {}: {e}", settings_path.display());
-                    "unknown — settings.json malformed"
-                }
-                Ok(v) => {
-                    if check_mem_hooks_present(&v) {
-                        "installed"
-                    } else {
-                        "NOT installed — run `mem init`"
+        String::new()
+    };
+
+    if existing.contains(CLAUDE_MD_MARKER) {
+        return Ok(false);
+    }
+
+    let new_content = if existing.is_empty() {
+        CLAUDE_MD_BLOCK.to_string()
+    } else if existing.ends_with('\n') {
+        format!("{existing}\n{CLAUDE_MD_BLOCK}")
+    } else {
+        format!("{existing}\n\n{CLAUDE_MD_BLOCK}")
+    };
+
+    std::fs::write(path, new_content).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
+// ── session-start ─────────────────────────────────────────────────────────────
+
+fn cmd_session_start(project_override: Option<PathBuf>) -> Result<()> {
+    let cwd = resolve_cwd(project_override)?;
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some((content, path)) = find_memory_md(&cwd) {
+        parts.push(format!(
+            "# Project Memory (`{}`)\n\n{}",
+            path.display(),
+            content.trim()
+        ));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let global = home.join(".claude").join("MEMORY.md");
+        if global.exists() {
+            match std::fs::read_to_string(&global) {
+                Ok(content) => {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(format!("# Global Memory\n\n{trimmed}"));
                     }
                 }
-            },
+                Err(e) => eprintln!("mem: cannot read global memory {}: {e}", global.display()),
+            }
         }
-    };
-    println!("Hooks    : {hooks_status}");
+    }
 
-    println!();
-
-    if !db_path.exists() {
-        println!("Database : {} (not created yet)", db_path.display());
+    if parts.is_empty() {
         return Ok(());
     }
 
-    let db = Db::open(&db_path)?;
-    let s = db.stats()?;
-    println!("Database : {}", db_path.display());
-    println!(
-        "Memories : {} ({} active, {} cold)",
-        s.memory_count, s.active_count, s.cold_count
-    );
-    println!("Sessions : {}", s.session_count);
-    println!("Projects : {}", s.project_count);
-    println!("DB size  : {} KB", s.db_size_bytes / 1024);
+    let output = SessionStartOutput {
+        system_message: parts.join("\n\n---\n\n"),
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
 
-    match db.last_capture_time() {
-        Ok(Some(dt)) => println!("Last cap : {}", dt.format("%Y-%m-%d %H:%M UTC")),
-        Ok(None) => {}
-        Err(e) => eprintln!("[mem] warn: could not read last capture time: {e}"),
-    }
+// ── status ────────────────────────────────────────────────────────────────────
 
-    match db.gain_stats() {
-        Ok(g) if g.session_count > 0 => {
-            println!();
-            println!(
-                "Analytics: Cache efficiency {:.1}%, avg {:.0} turns/session",
-                g.cache_efficiency_pct(),
-                g.avg_turns
-            );
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("[mem] warn: could not load analytics: {e}"),
-    }
+fn cmd_status() -> Result<()> {
+    let home = dirs::home_dir().context("$HOME not set")?;
+    let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mem"));
+
+    println!("Binary    : {}", bin.display());
+
+    let hook_status = check_session_start_hook(&home.join(".claude").join("settings.json"));
+    println!("Hook      : {hook_status}");
+
+    let rule_status = match std::fs::read_to_string(home.join(".claude").join("CLAUDE.md")) {
+        Ok(c) if c.contains(CLAUDE_MD_MARKER) => "installed",
+        Ok(_) => "NOT installed — run `mem init`",
+        Err(_) => "NOT installed — run `mem init`",
+    };
+    println!("Rule      : {rule_status}");
+
+    let index = load_index();
+    println!("Indexed   : {} MEMORY.md file(s)", index.len());
 
     Ok(())
 }
 
-/// Returns true if the Stop hook for `mem auto` is present in settings.
-/// Used by `cmd_status` as a proxy for "any mem hook installed", not "all hooks installed".
-/// Does not verify SessionStart or PreCompact hooks.
-pub fn check_mem_hooks_present(settings: &serde_json::Value) -> bool {
-    let stop_hooks = settings
-        .get("hooks")
-        .and_then(|h| h.get("Stop"))
-        .and_then(|s| s.as_array());
+// ── index ─────────────────────────────────────────────────────────────────────
 
-    stop_hooks.is_some_and(|arr| {
+fn cmd_index() -> Result<()> {
+    let mut existing = load_index();
+    let mut new_count = 0usize;
+    let mut updated_count = 0usize;
+    let mut unchanged_count = 0usize;
+    let mut error_count = 0usize;
+
+    // Collect candidate MEMORY.md paths from ~/.claude/projects/
+    // Only Location 2 (~/.claude/projects/<encoded>/memory/MEMORY.md) is used —
+    // decoding the encoded dir name back to a filesystem path is lossy (both '/' and '.'
+    // map to '-'), so attempting to locate git-root MEMORY.md via decoding produces
+    // wrong paths for any project with hyphens or dots in its name.
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        let projects_dir = home.join(".claude").join("projects");
+        match std::fs::read_dir(&projects_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let encoded = entry
+                        .path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    candidates.push((
+                        decode_project_name(&encoded),
+                        entry.path().join("memory").join("MEMORY.md"),
+                    ));
+                }
+            }
+            Err(e) if projects_dir.exists() => {
+                eprintln!("mem: cannot read {}: {e}", projects_dir.display());
+            }
+            Err(_) => {} // projects dir doesn't exist yet — first run, expected
+        }
+    }
+
+    for (project, path) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        let mtime = file_mtime(&path);
+
+        if let Some(entry) = existing.iter_mut().find(|e| e.path == path_str) {
+            if entry.mtime == mtime {
+                unchanged_count += 1;
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    entry.content = content;
+                    entry.mtime = mtime;
+                    updated_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("mem: cannot read {}: {e}", path.display());
+                    error_count += 1;
+                }
+            }
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    existing.push(IndexEntry {
+                        project,
+                        path: path_str,
+                        content,
+                        mtime,
+                    });
+                    new_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("mem: cannot read {}: {e}", path.display());
+                    error_count += 1;
+                }
+            }
+        }
+    }
+
+    // Remove entries whose files no longer exist
+    let before = existing.len();
+    existing.retain(|e| std::path::Path::new(&e.path).exists());
+    let pruned = before - existing.len();
+
+    save_index(&existing)?;
+
+    if error_count > 0 {
+        println!(
+            "Indexed: {} new, {} updated, {} unchanged, {} pruned, {} errors ({} total)",
+            new_count,
+            updated_count,
+            unchanged_count,
+            pruned,
+            error_count,
+            existing.len()
+        );
+        std::process::exit(1);
+    } else {
+        println!(
+            "Indexed: {} new, {} updated, {} unchanged, {} pruned ({} total)",
+            new_count,
+            updated_count,
+            unchanged_count,
+            pruned,
+            existing.len()
+        );
+    }
+    Ok(())
+}
+
+// ── search ────────────────────────────────────────────────────────────────────
+
+fn cmd_search(query: String) -> Result<()> {
+    let index = load_index();
+
+    if index.is_empty() {
+        println!("No files indexed. Run `mem index` first.");
+        return Ok(());
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut found = false;
+
+    for entry in &index {
+        let matches: Vec<&str> = entry
+            .content
+            .lines()
+            .filter(|l| l.to_lowercase().contains(&query_lower))
+            .collect();
+
+        if !matches.is_empty() {
+            println!("── {} ──", entry.project);
+            for line in matches {
+                println!("  {}", line.trim());
+            }
+            println!();
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("No matches for: {query}");
+    }
+    Ok(())
+}
+
+// ── index persistence ─────────────────────────────────────────────────────────
+
+fn index_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".mem").join("index.json"))
+}
+
+fn load_index() -> Vec<IndexEntry> {
+    let Some(path) = index_path() else {
+        return Vec::new();
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            eprintln!("mem: cannot read index {}: {e}", path.display());
+            eprintln!("mem: run `mem index` to rebuild, or check file permissions");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("mem: index at {} is corrupt ({e})", path.display());
+            eprintln!("mem: run `mem index` to rebuild it");
+            Vec::new()
+        }
+    }
+}
+
+fn save_index(entries: &[IndexEntry]) -> Result<()> {
+    let path = index_path().context("$HOME not set")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string(entries)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn resolve_cwd(project_override: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = project_override {
+        return Ok(p);
+    }
+    if std::io::stdin().is_terminal() {
+        return Ok(std::env::current_dir()?);
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    match serde_json::from_str::<HookStdin>(&buf) {
+        Ok(hook) => Ok(hook
+            .cwd
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir()?)),
+        Err(e) => {
+            eprintln!(
+                "mem: session-start received unexpected stdin ({e}); \
+                 falling back to current directory. Payload: {:?}",
+                &buf[..buf.len().min(200)]
+            );
+            Ok(std::env::current_dir()?)
+        }
+    }
+}
+
+fn find_memory_md(cwd: &Path) -> Option<(String, PathBuf)> {
+    // Strategy 1: git repo root
+    if let Some(root) = git_repo_root(cwd) {
+        let path = PathBuf::from(&root).join("MEMORY.md");
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(c) => return Some((c, path)),
+                Err(e) => eprintln!("mem: cannot read {}: {e}", path.display()),
+            }
+        }
+    }
+    // Strategy 2: ~/.claude/projects/<encoded>/memory/MEMORY.md
+    let projects = dirs::home_dir()?.join(".claude").join("projects");
+    let canonical = std::fs::canonicalize(cwd).ok()?;
+    let encoded = "-".to_string()
+        + &canonical
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace(['/', '.'], "-");
+    let path = projects.join(encoded).join("memory").join("MEMORY.md");
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(c) => return Some((c, path)),
+            Err(e) => eprintln!("mem: cannot read {}: {e}", path.display()),
+        }
+    }
+    None
+}
+
+fn git_repo_root(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn file_mtime(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn hook_command_exists(entry: &serde_json::Value, cmd: &str) -> bool {
+    entry.as_array().is_some_and(|arr| {
         arr.iter().any(|item| {
             item.get("hooks")
                 .and_then(|h| h.as_array())
                 .is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            // Match "mem auto" as a word-boundary substring to avoid false
-                            // positives from third-party hooks that happen to mention both words.
-                            .is_some_and(|c| {
-                                c.ends_with(" auto")
-                                    && (c.ends_with("/mem auto") || c.ends_with("\\mem auto") || {
-                                        // Also match bare "mem auto" (no path prefix)
-                                        c == "mem auto" || c.starts_with("mem auto ")
-                                    })
-                            })
-                    })
+                    hooks
+                        .iter()
+                        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(cmd))
                 })
         })
     })
 }
 
-fn cmd_suggest_rules(db_path: PathBuf, limit: usize) -> Result<()> {
-    let db = Db::open(&db_path)?;
-    let memories = db.recent_auto_memories(limit)?;
-
-    if memories.is_empty() {
-        println!("No auto-captured memories found. Run some sessions with the Stop hook first.");
-        return Ok(());
-    }
-
-    let output = suggest::suggest_rules(&memories);
-    print!("{output}");
+fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(value)? + "\n")
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 
-fn cmd_gain(db_path: PathBuf) -> Result<()> {
-    if !db_path.exists() {
-        println!(
-            "No session analytics yet. Run a Claude Code session with mem hooks installed to start tracking."
-        );
-        return Ok(());
-    }
-    let db = Db::open(&db_path)?;
-    let g = db.gain_stats()?;
-
-    if g.session_count == 0 {
-        println!(
-            "No session analytics yet. Run a Claude Code session with mem hooks installed to start tracking."
-        );
-        return Ok(());
-    }
-
-    let cache_efficiency = g.cache_efficiency_pct();
-
-    println!("Session Analytics");
-    println!("{}", "=".repeat(52));
-    println!();
-    println!("Total sessions:    {}", g.session_count);
-    println!("Total time:        {}", format_duration(g.total_secs));
-    println!();
-    println!("Token Usage");
-    println!("{}", "-".repeat(52));
-    println!("Input tokens:      {}", format_tokens(g.total_input));
-    println!("Output tokens:     {}", format_tokens(g.total_output));
-    println!("Cache read:        {}", format_tokens(g.total_cache_read));
-    println!(
-        "Cache creation:    {}",
-        format_tokens(g.total_cache_creation)
-    );
-    println!();
-    println!(
-        "Cache efficiency:  {} {:.1}%",
-        efficiency_bar(cache_efficiency),
-        cache_efficiency
-    );
-
-    if !g.top_projects.is_empty() {
-        println!();
-        println!("Top Projects by Tokens");
-        println!("{}", "-".repeat(52));
-        println!(
-            "  #  {:<22} {:>8}    {:>8}",
-            "Project", "Sessions", "Tokens"
-        );
-        println!("{}", "-".repeat(52));
-        for (i, row) in g.top_projects.iter().enumerate() {
-            let name = if row.project.chars().count() > 22 {
-                format!("{}...", row.project.chars().take(19).collect::<String>())
-            } else {
-                row.project.clone()
-            };
-            println!(
-                " {:>2}.  {:<22} {:>8}    {:>8}",
-                i + 1,
-                name,
-                row.sessions,
-                format_tokens(row.total_tokens)
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn format_tokens(n: i64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
+fn check_session_start_hook(settings_path: &Path) -> &'static str {
+    let Ok(raw) = std::fs::read_to_string(settings_path) else {
+        return "NOT installed — run `mem init`";
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return "malformed settings.json";
+    };
+    let has_hook = val
+        .get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|arr| {
+            arr.iter().any(|item| {
+                item.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.ends_with(" session-start"))
+                        })
+                    })
+            })
+        });
+    if has_hook {
+        "installed"
     } else {
-        n.to_string()
+        "NOT installed — run `mem init`"
     }
 }
 
-fn format_duration(secs: i64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    match (h, m) {
-        (h, _) if h > 0 => format!("{h}h {m:02}m"),
-        (_, m) if m > 0 => format!("{m}m {s:02}s"),
-        _ => format!("{s}s"),
-    }
+/// Return a human-readable project label from a Claude-encoded dir name.
+/// The encoding is lossy (both '/' and '.' map to '-'), so we don't attempt
+/// to decode — we just strip the leading '-' and use the result as-is.
+fn decode_project_name(encoded: &str) -> String {
+    encoded.trim_start_matches('-').to_string()
 }
 
-fn efficiency_bar(pct: f64) -> String {
-    let filled = (((pct / 100.0) * 20.0).round() as usize).min(20);
-    let empty = 20 - filled;
-    format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
-}
+// ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── format_duration ───────────────────────────────────────────────────────
-
     #[test]
-    fn format_duration_seconds_only() {
-        assert_eq!(format_duration(0), "0s");
-        assert_eq!(format_duration(1), "1s");
-        assert_eq!(format_duration(59), "59s");
-    }
-
-    #[test]
-    fn format_duration_minutes_and_seconds() {
-        // This was the fixed bug: previously emitted "1m" without seconds
-        assert_eq!(format_duration(60), "1m 00s");
-        assert_eq!(format_duration(65), "1m 05s");
-        assert_eq!(format_duration(90), "1m 30s");
-        assert_eq!(format_duration(3599), "59m 59s");
-    }
-
-    #[test]
-    fn format_duration_hours_and_minutes() {
-        assert_eq!(format_duration(3600), "1h 00m");
-        assert_eq!(format_duration(3660), "1h 01m");
-        assert_eq!(format_duration(3665), "1h 01m"); // seconds dropped at hour scale
-        assert_eq!(format_duration(7200), "2h 00m");
-        assert_eq!(format_duration(7384), "2h 03m");
-    }
-
-    // ── format_tokens ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn format_tokens_raw_below_thousand() {
-        assert_eq!(format_tokens(0), "0");
-        assert_eq!(format_tokens(999), "999");
-    }
-
-    #[test]
-    fn format_tokens_thousands() {
-        assert_eq!(format_tokens(1_000), "1.0K");
-        assert_eq!(format_tokens(1_500), "1.5K");
-        assert_eq!(format_tokens(999_999), "1000.0K");
-    }
-
-    #[test]
-    fn format_tokens_millions() {
-        assert_eq!(format_tokens(1_000_000), "1.0M");
-        assert_eq!(format_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn format_tokens_billions() {
-        assert_eq!(format_tokens(1_000_000_000), "1.0B");
-        assert_eq!(format_tokens(2_000_000_000), "2.0B");
-    }
-
-    // ── efficiency_bar ────────────────────────────────────────────────────────
-
-    #[test]
-    fn efficiency_bar_zero_percent_is_all_empty() {
-        let bar = efficiency_bar(0.0);
-        assert!(!bar.contains('\u{2588}'), "0% should have no filled blocks");
-        assert_eq!(bar.chars().count(), 20);
-    }
-
-    #[test]
-    fn efficiency_bar_hundred_percent_is_all_filled() {
-        let bar = efficiency_bar(100.0);
-        assert!(
-            !bar.contains('\u{2591}'),
-            "100% should have no empty blocks"
-        );
-        assert_eq!(bar.chars().count(), 20);
-    }
-
-    #[test]
-    fn efficiency_bar_fifty_percent_is_half_filled() {
-        let bar = efficiency_bar(50.0);
-        let filled = bar.chars().filter(|&c| c == '\u{2588}').count();
-        let empty = bar.chars().filter(|&c| c == '\u{2591}').count();
-        assert_eq!(filled, 10);
-        assert_eq!(empty, 10);
-    }
-
-    // ── cmd_init tests ────────────────────────────────────────────────────────
-
-    fn write_settings(dir: &std::path::Path, json: serde_json::Value) -> std::path::PathBuf {
-        let path = dir.join("settings.json");
-        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
-        path
-    }
-
-    fn run_init_on(settings_path: &std::path::Path) -> Result<()> {
-        apply_hooks_to_settings(settings_path).map(|_| ())
-    }
-
-    #[test]
-    fn cmd_init_adds_hooks_to_settings_json() {
+    fn wire_claude_md_adds_block_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let settings_path = tmp.path().join("settings.json");
-        std::fs::write(&settings_path, r#"{"model":"claude-opus-4-6"}"#).unwrap();
+        let path = tmp.path().join("CLAUDE.md");
+        std::fs::write(&path, "# Existing\n\nSome content.\n").unwrap();
 
-        run_init_on(&settings_path).unwrap();
+        assert!(wire_claude_md(&path).unwrap());
 
-        let raw = std::fs::read_to_string(&settings_path).unwrap();
-        let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let hooks = val.get("hooks").unwrap();
-
-        // SessionStart hook added
-        assert!(hooks.get("SessionStart").is_some(), "SessionStart missing");
-        // Stop hook added
-        assert!(hooks.get("Stop").is_some(), "Stop missing");
-        // PreCompact hooks added
-        let precompact = hooks.get("PreCompact").and_then(|p| p.as_array()).unwrap();
-        let has_auto = precompact
-            .iter()
-            .any(|item| item.get("matcher").and_then(|m| m.as_str()) == Some("auto"));
-        let has_manual = precompact
-            .iter()
-            .any(|item| item.get("matcher").and_then(|m| m.as_str()) == Some("manual"));
-        assert!(has_auto, "PreCompact auto missing");
-        assert!(has_manual, "PreCompact manual missing");
-
-        // Existing keys preserved
-        assert_eq!(
-            val.get("model").and_then(|m| m.as_str()),
-            Some("claude-opus-4-6")
-        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(CLAUDE_MD_MARKER));
+        assert!(content.contains("Existing"));
     }
 
     #[test]
-    fn cmd_init_is_idempotent() {
+    fn wire_claude_md_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let settings_path = tmp.path().join("settings.json");
-        std::fs::write(&settings_path, "{}").unwrap();
-
-        run_init_on(&settings_path).unwrap();
-        run_init_on(&settings_path).unwrap();
-
-        let raw = std::fs::read_to_string(&settings_path).unwrap();
-        let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let hooks = val.get("hooks").unwrap();
-
-        // No duplicate entries
-        let stop = hooks.get("Stop").and_then(|s| s.as_array()).unwrap();
-        assert_eq!(stop.len(), 1, "Stop hook should not be duplicated");
-
-        let session_start = hooks
-            .get("SessionStart")
-            .and_then(|s| s.as_array())
-            .unwrap();
+        let path = tmp.path().join("CLAUDE.md");
+        wire_claude_md(&path).unwrap();
+        assert!(!wire_claude_md(&path).unwrap());
         assert_eq!(
-            session_start.len(),
-            1,
-            "SessionStart should not be duplicated"
-        );
-
-        let precompact = hooks.get("PreCompact").and_then(|p| p.as_array()).unwrap();
-        assert_eq!(
-            precompact.len(),
-            2,
-            "PreCompact should have exactly 2 entries (auto + manual)"
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches(CLAUDE_MD_MARKER)
+                .count(),
+            1
         );
     }
 
     #[test]
-    fn cmd_init_preserves_existing_keys() {
+    fn wire_claude_md_creates_file_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let existing = serde_json::json!({
-            "env": {"MY_VAR": "hello"},
-            "permissions": {"allow": ["Read"]},
-            "model": "claude-haiku-4-5-20251001",
-            "enabledPlugins": ["context7"]
-        });
-        let settings_path = write_settings(tmp.path(), existing);
-        run_init_on(&settings_path).unwrap();
-
-        let raw = std::fs::read_to_string(&settings_path).unwrap();
-        let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(
-            val["env"]["MY_VAR"].as_str(),
-            Some("hello"),
-            "env must survive init"
-        );
-        assert_eq!(
-            val["model"].as_str(),
-            Some("claude-haiku-4-5-20251001"),
-            "model must survive init"
-        );
-        assert_eq!(
-            val["enabledPlugins"][0].as_str(),
-            Some("context7"),
-            "enabledPlugins must survive init"
-        );
-    }
-
-    // ── check_mem_hooks_present tests ─────────────────────────────────────────
-
-    #[test]
-    fn check_mem_hooks_present_detects_stop_hook() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/mem auto"}]}]
-            }
-        });
-        assert!(check_mem_hooks_present(&settings));
+        let path = tmp.path().join("CLAUDE.md");
+        wire_claude_md(&path).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(CLAUDE_MD_MARKER));
     }
 
     #[test]
-    fn check_mem_hooks_present_returns_false_when_absent() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "/other/tool run"}]}]
-            }
-        });
-        assert!(!check_mem_hooks_present(&settings));
-    }
-
-    #[test]
-    fn check_mem_hooks_present_returns_false_when_no_hooks() {
-        let settings = serde_json::json!({"model": "claude-sonnet-4-6"});
-        assert!(!check_mem_hooks_present(&settings));
-    }
-
-    #[test]
-    fn cmd_init_adds_missing_hooks_when_stop_already_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Pre-populate with only the Stop hook
-        let existing = serde_json::json!({
-            "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "/some/other/mem auto"}]}]
-            }
-        });
-        let settings_path = write_settings(tmp.path(), existing);
-        let added = apply_hooks_to_settings(&settings_path).unwrap();
-
-        // Stop already has a mem-auto-like command, but it's a different binary path.
-        // The new binary path should still be added (dedup is per exact command string).
-        // What matters: SessionStart and PreCompact must be added.
-        let added_labels: Vec<&str> = added.iter().copied().collect();
-        assert!(
-            added_labels.contains(&"SessionStart hook"),
-            "SessionStart should be added when absent"
-        );
-        assert!(
-            added_labels.contains(&"PreCompact hook (auto)"),
-            "PreCompact auto should be added when absent"
-        );
-        assert!(
-            added_labels.contains(&"PreCompact hook (manual)"),
-            "PreCompact manual should be added when absent"
-        );
-    }
-
-    #[test]
-    fn cmd_context_compact_output_includes_memory_md_prefix() {
-        use crate::types::CompactContextOutput;
-
-        // Simulate the compact path: given a MEMORY.md content, verify the
-        // CompactContextOutput JSON structure has "# Project Memory" prefix.
-        let memory_md_content = "# Test\n\nsome notes".to_string();
-        let md_section = format!("# Project Memory\n\n{memory_md_content}");
-
-        let output = CompactContextOutput {
-            additional_context: md_section,
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        let ctx = parsed["additionalContext"].as_str().unwrap();
-        assert!(
-            ctx.starts_with("# Project Memory"),
-            "compact output must start with '# Project Memory'"
-        );
-        assert!(
-            ctx.contains("some notes"),
-            "compact output must contain MEMORY.md body"
-        );
-    }
-
-    #[test]
-    fn apply_hooks_to_settings_returns_error_on_malformed_json() {
+    fn wire_session_start_hook_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"{broken json"#).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        wire_session_start_hook(&path).unwrap();
+        wire_session_start_hook(&path).unwrap();
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(val["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    }
 
-        let err = apply_hooks_to_settings(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("parse settings.json"),
-            "error should mention parse settings.json: {msg}"
-        );
+    #[test]
+    fn wire_session_start_hook_preserves_existing_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"model":"claude-sonnet-4-6"}"#).unwrap();
+        wire_session_start_hook(&path).unwrap();
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(val["model"].as_str(), Some("claude-sonnet-4-6"));
     }
 
     #[test]
     fn session_start_output_serializes_correctly() {
-        // Verify SessionStartOutput always produces the {"systemMessage":...} key
-        // that the Claude Code hook protocol requires.
-        let output = SessionStartOutput {
-            system_message: "hello world".to_string(),
+        let out = SessionStartOutput {
+            system_message: "hello".to_string(),
         };
-        let json = serde_json::to_string(&output).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(serde_json::to_string(&out)
+            .unwrap()
+            .contains(r#""systemMessage":"hello""#));
+    }
+
+    #[test]
+    fn decode_project_name_strips_leading_dash() {
         assert_eq!(
-            parsed["systemMessage"].as_str(),
-            Some("hello world"),
-            "must use camelCase 'systemMessage' key"
+            decode_project_name("-Users-hugo-projects-myapp"),
+            "Users-hugo-projects-myapp"
         );
-        // Empty message is also valid (fallback path)
-        let empty = SessionStartOutput {
-            system_message: String::new(),
+        // Hyphenated project names are preserved intact
+        assert_eq!(
+            decode_project_name("-Users-hugo-my-cool-app"),
+            "Users-hugo-my-cool-app"
+        );
+    }
+
+    #[test]
+    fn find_memory_md_returns_none_for_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_memory_md(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn index_roundtrip_new_and_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Override index path via a helper that takes an explicit path
+        let index_file = tmp.path().join("index.json");
+
+        let entry = IndexEntry {
+            project: "myapp".to_string(),
+            path: tmp.path().join("MEMORY.md").to_string_lossy().to_string(),
+            content: "- Used JWT for auth".to_string(),
+            mtime: 12345,
         };
-        let json2 = serde_json::to_string(&empty).unwrap();
-        assert!(json2.contains(r#""systemMessage":""#));
-    }
 
-    // ── apply_hooks_to_settings edge cases ────────────────────────────────────
+        // Serialize and reload
+        std::fs::write(&index_file, serde_json::to_string(&[&entry]).unwrap()).unwrap();
+        let loaded: Vec<IndexEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&index_file).unwrap()).unwrap();
 
-    #[test]
-    fn apply_hooks_settings_json_array_root_returns_error() {
-        // Top-level value is a JSON array, not an object → "settings.json must be a JSON object"
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"["not","an","object"]"#).unwrap();
-        let err = apply_hooks_to_settings(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("JSON object"),
-            "array-root settings.json should error with 'JSON object': {msg}"
-        );
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].project, "myapp");
+        assert_eq!(loaded[0].content, "- Used JWT for auth");
     }
 
     #[test]
-    fn apply_hooks_hooks_key_is_not_object_returns_error() {
-        // hooks is an array, not an object → "hooks must be a JSON object"
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"{"hooks":[]}"#).unwrap();
-        let err = apply_hooks_to_settings(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("hooks must be"),
-            "array hooks should error with 'hooks must be': {msg}"
-        );
-    }
-
-    #[test]
-    fn apply_hooks_stop_hooks_is_not_array_returns_error() {
-        // Stop hooks value is a string, not an array → "Stop hooks must be array"
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"{"hooks":{"Stop":"not-an-array"}}"#).unwrap();
-        let err = apply_hooks_to_settings(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("must be array"),
-            "non-array Stop hooks should error: {msg}"
-        );
-    }
-
-    // ── format_duration edge cases ────────────────────────────────────────────
-
-    #[test]
-    fn format_duration_negative_does_not_panic() {
-        // Negative input: defined behavior (truncation toward zero), must not panic
-        let result = format_duration(-1);
-        // Just verify it returns something reasonable without panicking
-        assert!(
-            !result.is_empty(),
-            "format_duration(-1) must return a non-empty string"
-        );
-    }
-
-    #[test]
-    fn format_duration_i64_max_does_not_overflow() {
-        let result = format_duration(i64::MAX);
-        assert!(
-            !result.is_empty(),
-            "format_duration(i64::MAX) must not panic"
-        );
-        assert!(
-            result.contains('h'),
-            "very large value should be hours: {result}"
-        );
-    }
-
-    // ── check_mem_hooks_present edge cases ────────────────────────────────────
-
-    #[test]
-    fn check_mem_hooks_present_handles_stop_as_non_array() {
-        // Stop is present but not an array — should return false, not panic
-        let settings = serde_json::json!({
-            "hooks": {"Stop": "not-an-array"}
-        });
-        assert!(!check_mem_hooks_present(&settings));
-    }
-
-    #[test]
-    fn check_mem_hooks_present_handles_hooks_as_non_object() {
-        // hooks is a string — should return false, not panic
-        let settings = serde_json::json!({"hooks": "wrong-type"});
-        assert!(!check_mem_hooks_present(&settings));
+    fn search_matches_lines_case_insensitive() {
+        let entries = vec![IndexEntry {
+            project: "proj".to_string(),
+            path: "/proj/MEMORY.md".to_string(),
+            content: "- Used JWT for auth\n- Rejected OAuth (too complex)".to_string(),
+            mtime: 0,
+        }];
+        let query = "jwt";
+        let matches: Vec<&str> = entries[0]
+            .content
+            .lines()
+            .filter(|l| l.to_lowercase().contains(query))
+            .collect();
+        assert_eq!(matches, vec!["- Used JWT for auth"]);
     }
 }
