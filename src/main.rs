@@ -310,22 +310,19 @@ fn cmd_stats(db_path: PathBuf) -> Result<()> {
     println!("DB path  : {}", db_path.display());
 
     // Session analytics summary
-    if let Ok(g) = db.gain_stats() {
-        if g.session_count > 0 {
-            let cache_efficiency = if g.total_input + g.total_cache_read > 0 {
-                g.total_cache_read as f64 / (g.total_cache_read + g.total_input) as f64 * 100.0
-            } else {
-                0.0
-            };
+    match db.gain_stats() {
+        Ok(g) if g.session_count > 0 => {
             println!();
             println!("Session Analytics");
             println!(
                 "Total time : {}   Cache efficiency : {:.1}%   Avg turns : {:.1}",
                 format_duration(g.total_secs),
-                cache_efficiency,
+                g.cache_efficiency_pct(),
                 g.avg_turns
             );
         }
+        Ok(_) => {}
+        Err(e) => eprintln!("[mem] warn: could not load session analytics: {e}"),
     }
 
     Ok(())
@@ -396,13 +393,7 @@ fn cmd_gain(db_path: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let total_input = g.total_input;
-    let total_cache_read = g.total_cache_read;
-    let cache_efficiency = if total_input + total_cache_read > 0 {
-        total_cache_read as f64 / (total_cache_read + total_input) as f64 * 100.0
-    } else {
-        0.0
-    };
+    let cache_efficiency = g.cache_efficiency_pct();
 
     println!("Session Analytics");
     println!("{}", "=".repeat(52));
@@ -436,8 +427,8 @@ fn cmd_gain(db_path: PathBuf) -> Result<()> {
         );
         println!("{}", "-".repeat(52));
         for (i, row) in g.top_projects.iter().enumerate() {
-            let name = if row.project.len() > 22 {
-                format!("{}...", &row.project[..19])
+            let name = if row.project.chars().count() > 22 {
+                format!("{}...", row.project.chars().take(19).collect::<String>())
             } else {
                 row.project.clone()
             };
@@ -477,8 +468,7 @@ fn format_duration(secs: i64) -> String {
 }
 
 fn efficiency_bar(pct: f64) -> String {
-    let filled = ((pct / 100.0) * 20.0).round() as usize;
-    let filled = filled.min(20);
+    let filled = (((pct / 100.0) * 20.0).round() as usize).min(20);
     let empty = 20 - filled;
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
 }

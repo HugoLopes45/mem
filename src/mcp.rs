@@ -417,11 +417,7 @@ impl MemServer {
         .map_err(mcp_err)?
         .map_err(mcp_err)?;
 
-        let cache_efficiency = if g.total_input + g.total_cache_read > 0 {
-            g.total_cache_read as f64 / (g.total_cache_read + g.total_input) as f64 * 100.0
-        } else {
-            0.0
-        };
+        let cache_efficiency = g.cache_efficiency_pct();
 
         let top_projects: Vec<serde_json::Value> = g
             .top_projects

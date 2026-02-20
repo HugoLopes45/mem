@@ -261,7 +261,8 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
     let mut output_tokens: i64 = 0;
     let mut cache_read_tokens: i64 = 0;
     let mut cache_creation_tokens: i64 = 0;
-    let mut timestamps: Vec<chrono::DateTime<chrono::FixedOffset>> = Vec::new();
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: Option<i64> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -273,10 +274,11 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
             Err(_) => continue,
         };
 
-        // Collect timestamps from any entry that has one
         if let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) {
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                timestamps.push(ts);
+                let secs = ts.timestamp();
+                first_ts = Some(first_ts.map_or(secs, |f: i64| f.min(secs)));
+                last_ts = Some(last_ts.map_or(secs, |l: i64| l.max(secs)));
             }
         }
 
@@ -297,12 +299,9 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
         return None;
     }
 
-    let duration_secs = if timestamps.len() >= 2 {
-        let first = timestamps.iter().min_by_key(|t| t.timestamp())?;
-        let last = timestamps.iter().max_by_key(|t| t.timestamp())?;
-        (last.timestamp() - first.timestamp()).max(0)
-    } else {
-        0
+    let duration_secs = match (first_ts, last_ts) {
+        (Some(first), Some(last)) => (last - first).max(0),
+        _ => 0,
     };
 
     Some(TranscriptAnalytics {

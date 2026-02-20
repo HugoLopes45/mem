@@ -160,6 +160,7 @@ pub struct HookStdin {
 }
 
 /// Analytics extracted from a session transcript JSONL file.
+// i64 matches rusqlite's native INTEGER decoding; all values are non-negative by construction.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptAnalytics {
     pub turn_count: i64,
@@ -184,11 +185,23 @@ pub struct GainStats {
     pub top_projects: Vec<ProjectGainRow>,
 }
 
+impl GainStats {
+    /// Percentage of total input-side tokens served from cache (0.0–100.0).
+    pub fn cache_efficiency_pct(&self) -> f64 {
+        let denominator = self.total_cache_read + self.total_input;
+        if denominator == 0 {
+            return 0.0;
+        }
+        self.total_cache_read as f64 / denominator as f64 * 100.0
+    }
+}
+
 /// One row from the top-projects-by-tokens query.
 #[derive(Debug)]
 pub struct ProjectGainRow {
     pub project: String,
     pub sessions: i64,
+    /// Sum of input + output + cache_read tokens. Excludes cache_creation.
     pub total_tokens: i64,
 }
 
