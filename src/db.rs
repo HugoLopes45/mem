@@ -4,7 +4,10 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::types::{DbStats, Memory, MemoryScope, MemoryStatus, MemoryType};
+use crate::types::{
+    DbStats, GainStats, Memory, MemoryScope, MemoryStatus, MemoryType, ProjectGainRow,
+    TranscriptAnalytics,
+};
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
@@ -49,6 +52,21 @@ impl Db {
             .context("migration 002: schema changes failed")?;
             conn.execute_batch("PRAGMA user_version = 2;")
                 .context("migration 002: failed to set user_version")?;
+        }
+
+        if version < 3 {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN duration_secs INTEGER;
+                 ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0;
+                 COMMIT;",
+            )
+            .context("migration 003: session analytics columns failed")?;
+            conn.execute_batch("PRAGMA user_version = 3;")
+                .context("migration 003: failed to set user_version")?;
         }
 
         Ok(Self { conn })
@@ -312,6 +330,34 @@ impl Db {
         Ok(())
     }
 
+    /// Write transcript analytics to a session row. No-op if session not found.
+    pub fn update_session_analytics(
+        &self,
+        id: &str,
+        analytics: &TranscriptAnalytics,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET
+                 turn_count = ?1,
+                 duration_secs = ?2,
+                 input_tokens = ?3,
+                 output_tokens = ?4,
+                 cache_read_tokens = ?5,
+                 cache_creation_tokens = ?6
+             WHERE id = ?7",
+            params![
+                analytics.turn_count,
+                analytics.duration_secs,
+                analytics.input_tokens,
+                analytics.output_tokens,
+                analytics.cache_read_tokens,
+                analytics.cache_creation_tokens,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<DbStats> {
@@ -370,6 +416,67 @@ impl Db {
             db_size_bytes,
             active_count,
             cold_count,
+        })
+    }
+
+    /// Aggregate token/time analytics across all sessions.
+    pub fn gain_stats(&self) -> Result<GainStats> {
+        let row = self.conn.query_row(
+            "SELECT
+                 COUNT(*) as session_count,
+                 COALESCE(SUM(duration_secs), 0) as total_secs,
+                 COALESCE(SUM(input_tokens), 0) as total_input,
+                 COALESCE(SUM(output_tokens), 0) as total_output,
+                 COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
+                 COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation,
+                 COALESCE(AVG(CAST(turn_count AS REAL)), 0.0) as avg_turns,
+                 COALESCE(AVG(CAST(duration_secs AS REAL)), 0.0) as avg_secs
+             FROM sessions",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, f64>(6)?,
+                    r.get::<_, f64>(7)?,
+                ))
+            },
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT project, COUNT(*) as sessions,
+                    SUM(input_tokens + output_tokens + cache_read_tokens) as total_tokens
+             FROM sessions
+             WHERE project IS NOT NULL
+             GROUP BY project
+             ORDER BY total_tokens DESC
+             LIMIT 5",
+        )?;
+        let top_projects = stmt
+            .query_map([], |r| {
+                Ok(ProjectGainRow {
+                    project: r.get(0)?,
+                    sessions: r.get(1)?,
+                    total_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                })
+            })?
+            .map(|r| r.map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(GainStats {
+            session_count: row.0,
+            total_secs: row.1,
+            total_input: row.2,
+            total_output: row.3,
+            total_cache_read: row.4,
+            total_cache_creation: row.5,
+            avg_turns: row.6,
+            avg_secs: row.7,
+            top_projects,
         })
     }
 
@@ -786,13 +893,13 @@ mod tests {
     // ── Migration versioning tests ────────────────────────────────────────────
 
     #[test]
-    fn in_memory_db_has_user_version_2() {
+    fn in_memory_db_has_user_version_3() {
         let db = in_memory_db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "in-memory DB must migrate to version 2");
+        assert_eq!(version, 3, "in-memory DB must migrate to version 3");
     }
 
     #[test]
@@ -1213,6 +1320,21 @@ mod tests {
         );
     }
 
+    // ── gain_stats tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn gain_stats_returns_zero_for_empty_db() {
+        let db = in_memory_db();
+        let g = db.gain_stats().unwrap();
+        assert_eq!(g.session_count, 0, "no sessions in empty db");
+        assert_eq!(g.total_input, 0);
+        assert_eq!(g.total_output, 0);
+        assert_eq!(g.total_cache_read, 0);
+        assert_eq!(g.total_cache_creation, 0);
+        assert_eq!(g.total_secs, 0);
+        assert!(g.top_projects.is_empty());
+    }
+
     // ── Migration idempotency test ───────────────────────────────────────────
 
     #[test]
@@ -1227,7 +1349,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "user_version should remain 2 on reopen");
+        assert_eq!(version, 3, "user_version should remain 3 on reopen");
     }
 
     // ── Cold global memory excluded from scoped search ───────────────────────

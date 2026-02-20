@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::db::Db;
-use crate::types::{HookStdin, Memory, MemoryType};
+use crate::types::{HookStdin, Memory, MemoryType, TranscriptAnalytics};
 
 pub struct AutoCapture {
     pub project: PathBuf,
     pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
 }
 
 /// Summary of git changes for a session.
@@ -53,6 +54,7 @@ impl AutoCapture {
         Ok(Some(Self {
             project,
             session_id: hook.session_id,
+            transcript_path: hook.transcript_path,
         }))
     }
 
@@ -70,6 +72,15 @@ impl AutoCapture {
         if let Some(ref sid) = self.session_id {
             if let Err(e) = db.end_session(sid) {
                 eprintln!("[mem] warn: end_session failed for {sid}: {e}");
+            }
+
+            // Parse transcript analytics if available — non-fatal
+            if let Some(ref tp) = self.transcript_path {
+                if let Some(analytics) = parse_transcript(tp) {
+                    if let Err(e) = db.update_session_analytics(sid, &analytics) {
+                        eprintln!("[mem] warn: update_session_analytics failed for {sid}: {e}");
+                    }
+                }
             }
         }
 
@@ -236,6 +247,74 @@ pub fn git_repo_root(path: &Path) -> Option<String> {
     }
 }
 
+/// Parse a JSONL transcript file and extract session analytics.
+///
+/// Returns `None` if the file is unreadable or contains no assistant entries.
+/// Skips lines that fail JSON parsing without aborting.
+pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| eprintln!("[mem] warn: could not read transcript {path}: {e}"))
+        .ok()?;
+
+    let mut turn_count: i64 = 0;
+    let mut input_tokens: i64 = 0;
+    let mut output_tokens: i64 = 0;
+    let mut cache_read_tokens: i64 = 0;
+    let mut cache_creation_tokens: i64 = 0;
+    let mut timestamps: Vec<chrono::DateTime<chrono::FixedOffset>> = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Collect timestamps from any entry that has one
+        if let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                timestamps.push(ts);
+            }
+        }
+
+        if val.get("type").and_then(|v| v.as_str()) == Some("assistant") {
+            turn_count += 1;
+
+            if let Some(usage) = val.get("message").and_then(|m| m.get("usage")) {
+                let get_i64 = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                input_tokens += get_i64("input_tokens");
+                output_tokens += get_i64("output_tokens");
+                cache_read_tokens += get_i64("cache_read_input_tokens");
+                cache_creation_tokens += get_i64("cache_creation_input_tokens");
+            }
+        }
+    }
+
+    if turn_count == 0 {
+        return None;
+    }
+
+    let duration_secs = if timestamps.len() >= 2 {
+        let first = timestamps.iter().min_by_key(|t| t.timestamp())?;
+        let last = timestamps.iter().max_by_key(|t| t.timestamp())?;
+        (last.timestamp() - first.timestamp()).max(0)
+    } else {
+        0
+    };
+
+    Some(TranscriptAnalytics {
+        turn_count,
+        duration_secs,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    })
+}
+
 /// Format recent memories as markdown for context injection.
 pub fn format_context_markdown(memories: &[Memory]) -> String {
     if memories.is_empty() {
@@ -260,11 +339,60 @@ pub fn format_context_markdown(memories: &[Memory]) -> String {
 mod tests {
     use super::*;
 
+    // ── parse_transcript tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_transcript_extracts_turns_and_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","timestamp":"2026-02-20T09:00:00.000Z","message":{}}
+{"type":"assistant","timestamp":"2026-02-20T09:01:00.000Z","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":10}}}
+{"type":"progress","timestamp":"2026-02-20T09:01:30.000Z"}
+{"type":"assistant","timestamp":"2026-02-20T09:02:00.000Z","message":{"usage":{"input_tokens":80,"output_tokens":40,"cache_read_input_tokens":150,"cache_creation_input_tokens":5}}}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let analytics = parse_transcript(path.to_str().unwrap()).expect("should parse");
+        assert_eq!(analytics.turn_count, 2, "should count 2 assistant turns");
+        assert_eq!(analytics.input_tokens, 180, "input tokens summed");
+        assert_eq!(analytics.output_tokens, 90, "output tokens summed");
+        assert_eq!(analytics.cache_read_tokens, 350, "cache read summed");
+        assert_eq!(analytics.cache_creation_tokens, 15, "cache creation summed");
+        // duration: 09:02:00 - 09:00:00 = 120 seconds
+        assert_eq!(analytics.duration_secs, 120);
+    }
+
+    #[test]
+    fn parse_transcript_returns_none_on_missing_file() {
+        let result = parse_transcript("/tmp/nonexistent_mem_transcript_abc123.jsonl");
+        assert!(result.is_none(), "missing file should return None");
+    }
+
+    #[test]
+    fn parse_transcript_skips_non_assistant_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","timestamp":"2026-02-20T09:00:00.000Z","message":{}}
+{"type":"system","timestamp":"2026-02-20T09:00:01.000Z","message":{}}
+{"type":"progress","timestamp":"2026-02-20T09:00:02.000Z"}
+{"type":"assistant","timestamp":"2026-02-20T09:01:00.000Z","message":{"usage":{"input_tokens":42,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let analytics = parse_transcript(path.to_str().unwrap()).expect("should parse");
+        assert_eq!(analytics.turn_count, 1, "only assistant entries counted");
+        assert_eq!(analytics.input_tokens, 42);
+        assert_eq!(analytics.output_tokens, 7);
+    }
+
+    // ── build_title tests ──────────────────────────────────────────────────────
+
     #[test]
     fn build_title_uses_commit_msg_when_available() {
         let capture = AutoCapture {
             project: PathBuf::from("/tmp/myproject"),
             session_id: None,
+            transcript_path: None,
         };
         let changes = GitChanges {
             diff_stat: Some("1 file changed".to_string()),
@@ -279,6 +407,7 @@ mod tests {
         let capture = AutoCapture {
             project: PathBuf::from("/tmp/myproject"),
             session_id: None,
+            transcript_path: None,
         };
         let changes = GitChanges {
             diff_stat: Some("3 files changed, 142 insertions(+), 10 deletions(-)".to_string()),
@@ -296,6 +425,7 @@ mod tests {
         let capture = AutoCapture {
             project: PathBuf::from("/tmp/myproject"),
             session_id: None,
+            transcript_path: None,
         };
         let changes = GitChanges {
             diff_stat: None,
@@ -310,6 +440,7 @@ mod tests {
         let capture = AutoCapture {
             project: PathBuf::from("/tmp/myproject"),
             session_id: None,
+            transcript_path: None,
         };
         let changes = GitChanges {
             diff_stat: Some("1 file changed".to_string()),
@@ -326,6 +457,7 @@ mod tests {
         let capture = AutoCapture {
             project: PathBuf::from("/tmp/myproject"),
             session_id: None,
+            transcript_path: None,
         };
         let changes = GitChanges {
             diff_stat: None,

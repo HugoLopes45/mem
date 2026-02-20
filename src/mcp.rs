@@ -399,6 +399,57 @@ impl MemServer {
 
         ok_text(suggest_rules(&memories, limit))
     }
+
+    /// Session analytics: token usage, cache efficiency, top projects.
+    #[tool(
+        description = "Return session analytics as JSON: token counts, cache efficiency, avg turns, top projects by token usage."
+    )]
+    async fn mem_gain(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.clone();
+
+        let g = tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("db lock poisoned: {e}"))?;
+            db.gain_stats()
+        })
+        .await
+        .map_err(mcp_err)?
+        .map_err(mcp_err)?;
+
+        let cache_efficiency = if g.total_input + g.total_cache_read > 0 {
+            g.total_cache_read as f64 / (g.total_cache_read + g.total_input) as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        let top_projects: Vec<serde_json::Value> = g
+            .top_projects
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "project": r.project,
+                    "sessions": r.sessions,
+                    "total_tokens": r.total_tokens,
+                })
+            })
+            .collect();
+
+        let out = serde_json::json!({
+            "session_count": g.session_count,
+            "total_secs": g.total_secs,
+            "total_input_tokens": g.total_input,
+            "total_output_tokens": g.total_output,
+            "total_cache_read_tokens": g.total_cache_read,
+            "total_cache_creation_tokens": g.total_cache_creation,
+            "cache_efficiency_pct": (cache_efficiency * 10.0).round() / 10.0,
+            "avg_turns_per_session": (g.avg_turns * 10.0).round() / 10.0,
+            "avg_session_duration_secs": (g.avg_secs * 10.0).round() / 10.0,
+            "top_projects": top_projects,
+        });
+
+        ok_text(serde_json::to_string_pretty(&out).map_err(mcp_err)?)
+    }
 }
 
 #[tool_handler]

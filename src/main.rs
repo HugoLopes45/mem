@@ -129,6 +129,9 @@ enum Commands {
         limit: usize,
     },
 
+    /// Show session analytics: tokens, cache efficiency, top projects
+    Gain,
+
     /// Interactive search TUI (not yet implemented)
     Tui,
 }
@@ -168,6 +171,7 @@ fn main() -> Result<()> {
         Commands::Promote { id } => cmd_promote(db_path, id),
         Commands::Demote { id } => cmd_demote(db_path, id),
         Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
+        Commands::Gain => cmd_gain(db_path),
         Commands::Tui => {
             println!("TUI not yet implemented. Use `mem search <query>` for now.");
             Ok(())
@@ -304,6 +308,26 @@ fn cmd_stats(db_path: PathBuf) -> Result<()> {
     println!("Projects : {}", s.project_count);
     println!("DB size  : {} KB", s.db_size_bytes / 1024);
     println!("DB path  : {}", db_path.display());
+
+    // Session analytics summary
+    if let Ok(g) = db.gain_stats() {
+        if g.session_count > 0 {
+            let cache_efficiency = if g.total_input + g.total_cache_read > 0 {
+                g.total_cache_read as f64 / (g.total_cache_read + g.total_input) as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!();
+            println!("Session Analytics");
+            println!(
+                "Total time : {}   Cache efficiency : {:.1}%   Avg turns : {:.1}",
+                format_duration(g.total_secs),
+                cache_efficiency,
+                g.avg_turns
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -353,4 +377,108 @@ fn cmd_suggest_rules(db_path: PathBuf, limit: usize) -> Result<()> {
     let output = suggest::suggest_rules(&memories, limit);
     print!("{output}");
     Ok(())
+}
+
+fn cmd_gain(db_path: PathBuf) -> Result<()> {
+    if !db_path.exists() {
+        println!(
+            "No session analytics yet. Run a Claude Code session with mem hooks installed to start tracking."
+        );
+        return Ok(());
+    }
+    let db = Db::open(&db_path)?;
+    let g = db.gain_stats()?;
+
+    if g.session_count == 0 {
+        println!(
+            "No session analytics yet. Run a Claude Code session with mem hooks installed to start tracking."
+        );
+        return Ok(());
+    }
+
+    let total_input = g.total_input;
+    let total_cache_read = g.total_cache_read;
+    let cache_efficiency = if total_input + total_cache_read > 0 {
+        total_cache_read as f64 / (total_cache_read + total_input) as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    println!("Session Analytics");
+    println!("{}", "=".repeat(52));
+    println!();
+    println!("Total sessions:    {}", g.session_count);
+    println!("Total time:        {}", format_duration(g.total_secs));
+    println!();
+    println!("Token Usage");
+    println!("{}", "-".repeat(52));
+    println!("Input tokens:      {}", format_tokens(g.total_input));
+    println!("Output tokens:     {}", format_tokens(g.total_output));
+    println!("Cache read:        {}", format_tokens(g.total_cache_read));
+    println!(
+        "Cache creation:    {}",
+        format_tokens(g.total_cache_creation)
+    );
+    println!();
+    println!(
+        "Cache efficiency:  {} {:.1}%",
+        efficiency_bar(cache_efficiency),
+        cache_efficiency
+    );
+
+    if !g.top_projects.is_empty() {
+        println!();
+        println!("Top Projects by Tokens");
+        println!("{}", "-".repeat(52));
+        println!(
+            "  #  {:<22} {:>8}    {:>8}",
+            "Project", "Sessions", "Tokens"
+        );
+        println!("{}", "-".repeat(52));
+        for (i, row) in g.top_projects.iter().enumerate() {
+            let name = if row.project.len() > 22 {
+                format!("{}...", &row.project[..19])
+            } else {
+                row.project.clone()
+            };
+            println!(
+                " {:>2}.  {:<22} {:>8}    {:>8}",
+                i + 1,
+                name,
+                row.sessions,
+                format_tokens(row.total_tokens)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn format_tokens(n: i64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_duration(secs: i64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+fn efficiency_bar(pct: f64) -> String {
+    let filled = ((pct / 100.0) * 20.0).round() as usize;
+    let filled = filled.min(20);
+    let empty = 20 - filled;
+    format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
 }

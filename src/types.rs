@@ -155,6 +155,41 @@ pub struct HookStdin {
     pub cwd: Option<String>,
     pub session_id: Option<String>,
     pub stop_hook_active: Option<bool>,
+    /// Path to the JSONL transcript file — provided by Claude Code Stop hook.
+    pub transcript_path: Option<String>,
+}
+
+/// Analytics extracted from a session transcript JSONL file.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptAnalytics {
+    pub turn_count: i64,
+    pub duration_secs: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// Aggregate statistics across all sessions with analytics data.
+#[derive(Debug, Default)]
+pub struct GainStats {
+    pub session_count: i64,
+    pub total_secs: i64,
+    pub total_input: i64,
+    pub total_output: i64,
+    pub total_cache_read: i64,
+    pub total_cache_creation: i64,
+    pub avg_turns: f64,
+    pub avg_secs: f64,
+    pub top_projects: Vec<ProjectGainRow>,
+}
+
+/// One row from the top-projects-by-tokens query.
+#[derive(Debug)]
+pub struct ProjectGainRow {
+    pub project: String,
+    pub sessions: i64,
+    pub total_tokens: i64,
 }
 
 // Not serialized — formatted manually in cmd_stats. Adding Serialize here would
