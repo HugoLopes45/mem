@@ -59,15 +59,29 @@ else
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
 
-  if ! $FETCH "$URL" -o "$TMP/$ARCHIVE" 2>/dev/null; then
+  install_from_source() {
     warn "Pre-built binary not found for $TARGET. Falling back to cargo install..."
     if ! command -v cargo >/dev/null 2>&1; then
       error "cargo not found. Install Rust: https://rustup.rs"
     fi
     cargo install --git "https://github.com/$REPO" --locked
     INSTALLED_VIA="cargo"
+  }
+
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fsSL -o "$TMP/$ARCHIVE" "$URL" 2>/dev/null; then
+      install_from_source
+    fi
   else
-    tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
+    if ! wget -q -O "$TMP/$ARCHIVE" "$URL" 2>/dev/null; then
+      install_from_source
+    fi
+  fi
+
+  if [ -z "${INSTALLED_VIA:-}" ]; then
+    if ! tar -xzf "$TMP/$ARCHIVE" -C "$TMP" 2>/dev/null; then
+      error "Failed to extract archive. Download may be corrupted. Try: cargo install --git https://github.com/$REPO"
+    fi
     mkdir -p "$INSTALL_DIR"
     mv "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
     chmod +x "$INSTALL_DIR/$BIN_NAME"
@@ -91,8 +105,14 @@ HOOKS_SRC="$(dirname "${BASH_SOURCE[0]}")/hooks"
 if [ ! -d "$HOOKS_SRC" ]; then
   # Downloaded via curl — fetch hooks from GitHub
   for HOOK in mem-stop.sh mem-precompact.sh mem-session-start.sh; do
-    $FETCH "https://raw.githubusercontent.com/$REPO/main/hooks/$HOOK" \
-      -o "$HOOKS_DIR/$HOOK"
+    HOOK_URL="https://raw.githubusercontent.com/$REPO/main/hooks/$HOOK"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL -o "$HOOKS_DIR/$HOOK" "$HOOK_URL" 2>/dev/null || \
+        error "Failed to download hook $HOOK"
+    else
+      wget -q -O "$HOOKS_DIR/$HOOK" "$HOOK_URL" 2>/dev/null || \
+        error "Failed to download hook $HOOK"
+    fi
     chmod +x "$HOOKS_DIR/$HOOK"
   done
 else
