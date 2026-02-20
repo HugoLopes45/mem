@@ -1,2 +1,29 @@
+# Build artifacts
 /target/
+
+# Generated context files (written by mem-session-start.sh hook)
 .mem-context.md
+
+# SQLite temp files (should never be in project dir, but just in case)
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Cargo patch overrides (local dev only)
+[patch.crates-io]
