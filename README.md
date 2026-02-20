@@ -21,7 +21,7 @@ $ mem search "auth middleware"
 
 ## Why
 
-Claude Code agents forget everything when a session ends. The usual fix — calling `mem_save` manually — has three failure points: the agent must decide what to save, remember to call it, and remember to call `mem_context` at the next start. Most sessions end without any memory saved.
+Claude Code agents forget everything when a session ends. Manual memory tools have three failure points: the agent must decide what to save, remember to save it, and remember to load it at the next start. Most sessions end without any memory saved.
 
 `mem` uses Claude Code hooks that fire **reliably at session boundaries**. The infrastructure captures memory. The agent never has to think about it.
 
@@ -198,16 +198,16 @@ hooks/
 
 **Dependencies:** [`rusqlite`](https://crates.io/crates/rusqlite) (bundled SQLite + FTS5) · [`rmcp`](https://crates.io/crates/rmcp) (official Rust MCP SDK) · [`clap`](https://crates.io/crates/clap) · [`ratatui`](https://crates.io/crates/ratatui) (v0.2 TUI)
 
-## vs. alternatives
+## Design goals
 
-| | engram | mem_save | **mem** |
-|--|--------|----------|---------|
-| Capture trigger | Agent call | Agent call | **Hook (automatic)** |
-| Survives compaction | No | No | **Yes (PreCompact hook)** |
-| Context on start | Agent call | Agent call | **Automatic (SessionStart)** |
-| System deps | None | None | **None (bundled SQLite)** |
-| Search | — | — | **FTS5 + porter stemmer** |
-| MCP tools | Plugin | Manual | **6 built-in tools** |
+| | Manual memory tools | **mem** |
+|--|---------------------|---------|
+| Capture trigger | Agent must call | **Hook (automatic)** |
+| Survives compaction | No | **Yes (PreCompact hook)** |
+| Context on start | Agent must call | **Automatic (SessionStart)** |
+| System deps | Varies | **None (bundled SQLite)** |
+| Search | Varies | **FTS5 + porter stemmer** |
+| MCP tools | Varies | **6 built-in tools** |
 
 ## Contributing
 
