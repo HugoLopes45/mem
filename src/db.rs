@@ -11,6 +11,20 @@ use crate::types::{
 
 const SCHEMA: &str = include_str!("../migrations/001_init.sql");
 
+/// Wrap a raw query string in FTS5 phrase quotes, escaping embedded double-quotes.
+/// This prevents FTS5 operator injection (AND/OR/NEAR/column filters) while
+/// preserving normal word-level matching through the porter stemmer.
+fn fts_phrase_query(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+/// Collect a `MappedRows` iterator into `Result<Vec<T>>`, converting rusqlite errors.
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> Result<Vec<T>> {
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -115,10 +129,7 @@ impl Db {
         project: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Memory>> {
-        // Wrap in double-quotes to treat the query as a phrase, disabling raw FTS5
-        // operator injection (AND/OR/NEAR/column filters). Users can still search
-        // effectively; explicit FTS5 syntax is available via the CLI's own escaping.
-        let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let safe_query = fts_phrase_query(query);
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
         let mems = if let Some(proj) = project {
@@ -135,8 +146,7 @@ impl Db {
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![safe_query, proj, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            collect_rows(rows)?
         } else {
             // Without --project: return all (project + global) active memories
             let mut stmt = self.conn.prepare(
@@ -150,8 +160,7 @@ impl Db {
                  LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![safe_query, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            collect_rows(rows)?
         };
 
         let ids: Vec<String> = mems.iter().map(|m| m.id.clone()).collect();
@@ -173,8 +182,7 @@ impl Db {
                  ORDER BY created_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![proj, limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            collect_rows(rows)?
         } else {
             let mut stmt = self.conn.prepare(
                 "SELECT id, session_id, project, title, type, content, git_diff, created_at,
@@ -183,8 +191,7 @@ impl Db {
                  ORDER BY created_at DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit_i64], row_to_memory)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            collect_rows(rows)?
         };
 
         let ids: Vec<String> = mems.iter().map(|m| m.id.clone()).collect();
@@ -454,7 +461,7 @@ impl Db {
              ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit_i64], row_to_memory)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        collect_rows(rows)
     }
 
     // ── Indexed files ─────────────────────────────────────────────────────────
@@ -511,7 +518,7 @@ impl Db {
         project: Option<&str>,
         limit: usize,
     ) -> Result<Vec<IndexedFile>> {
-        let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let safe_query = fts_phrase_query(query);
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
         if let Some(proj) = project {
@@ -526,7 +533,7 @@ impl Db {
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![safe_query, proj, limit_i64], row_to_indexed_file)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
+            collect_rows(rows)
         } else {
             let mut stmt = self.conn.prepare(
                 "SELECT f.id, f.source_path, f.project_path, f.project_name, f.title,
@@ -538,7 +545,7 @@ impl Db {
                  LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![safe_query, limit_i64], row_to_indexed_file)?;
-            rows.map(|r| r.map_err(Into::into)).collect()
+            collect_rows(rows)
         }
     }
 
@@ -550,7 +557,7 @@ impl Db {
              ORDER BY project_name ASC",
         )?;
         let rows = stmt.query_map([], row_to_indexed_file)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        collect_rows(rows)
     }
 
     pub fn search_unified(

@@ -281,6 +281,16 @@ pub enum IndexEntryStatus {
     Skipped,
 }
 
+impl From<UpsertOutcome> for IndexEntryStatus {
+    fn from(o: UpsertOutcome) -> Self {
+        match o {
+            UpsertOutcome::New => Self::New,
+            UpsertOutcome::Updated => Self::Updated,
+            UpsertOutcome::Unchanged => Self::Unchanged,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SearchResult {
     Memory(Memory),

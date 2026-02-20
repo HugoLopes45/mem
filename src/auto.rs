@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use crate::db::Db;
 use crate::types::{
     HookStdin, IndexEntry, IndexEntryStatus, IndexStats, Memory, MemoryType, TranscriptAnalytics,
+    UpsertOutcome,
 };
 
 pub struct AutoCapture {
@@ -513,7 +514,11 @@ pub fn scan_and_index_memory_files_in(
                     "[mem] warn: error reading entry in {}: {e}",
                     claude_dir.display()
                 );
-                stats.skipped += 1;
+                stats.record(IndexEntry {
+                    project_name: String::new(),
+                    line_count: 0,
+                    status: IndexEntryStatus::Skipped,
+                });
                 continue;
             }
         };
@@ -535,7 +540,11 @@ pub fn scan_and_index_memory_files_in(
                     "[mem] warn: skipping non-UTF-8 project dir: {}",
                     project_dir.display()
                 );
-                stats.skipped += 1;
+                stats.record(IndexEntry {
+                    project_name: String::new(),
+                    line_count: 0,
+                    status: IndexEntryStatus::Skipped,
+                });
                 continue;
             }
         };
@@ -567,9 +576,10 @@ pub fn scan_and_index_memory_files_in(
 
         let mtime = read_mtime_secs(&memory_path);
 
-        if dry_run {
-            // In dry-run mode check the DB to report accurate would-be status
-            let status = match db.upsert_indexed_file(
+        // dry_run still writes to the DB so we can report accurate New/Updated/Unchanged status;
+        // it differs from a live run only in that errors are swallowed rather than propagated.
+        let status = if dry_run {
+            match db.upsert_indexed_file(
                 &source_path,
                 project_path.as_deref(),
                 &project_name,
@@ -577,37 +587,19 @@ pub fn scan_and_index_memory_files_in(
                 &content,
                 mtime,
             ) {
-                // dry_run intentionally runs the check but we don't commit — the DB
-                // is opened normally so we can detect Unchanged vs New accurately.
-                // Note: this does write to the DB; use `--dry-run` for preview only.
-                Ok(outcome) => match outcome {
-                    crate::types::UpsertOutcome::New => IndexEntryStatus::New,
-                    crate::types::UpsertOutcome::Updated => IndexEntryStatus::Updated,
-                    crate::types::UpsertOutcome::Unchanged => IndexEntryStatus::Unchanged,
-                },
+                Ok(outcome) => IndexEntryStatus::from(outcome),
                 Err(_) => IndexEntryStatus::New, // conservative fallback
-            };
-            stats.record(IndexEntry {
-                project_name,
-                line_count,
-                status,
-            });
-            continue;
-        }
-
-        let outcome = db.upsert_indexed_file(
-            &source_path,
-            project_path.as_deref(),
-            &project_name,
-            &title,
-            &content,
-            mtime,
-        )?;
-
-        let status = match outcome {
-            crate::types::UpsertOutcome::New => IndexEntryStatus::New,
-            crate::types::UpsertOutcome::Updated => IndexEntryStatus::Updated,
-            crate::types::UpsertOutcome::Unchanged => IndexEntryStatus::Unchanged,
+            }
+        } else {
+            let outcome: UpsertOutcome = db.upsert_indexed_file(
+                &source_path,
+                project_path.as_deref(),
+                &project_name,
+                &title,
+                &content,
+                mtime,
+            )?;
+            IndexEntryStatus::from(outcome)
         };
 
         stats.record(IndexEntry {
