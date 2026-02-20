@@ -9,21 +9,49 @@
 It hooks into Claude Code's `Stop`, `PreCompact`, and `SessionStart` events to automatically capture and restore session context. No `mem_save` calls. No setup per-project. Just install and wire the hooks once.
 
 ```
-$ echo '{"cwd":"/your/project","session_id":"abc"}' | mem save --auto
-[mem] saved: your-project: 3 files changed, 142 insertions(+) (d4f1a3…)
-
 $ mem search "auth middleware"
 [auto] your-project: added JWT auth middleware (2026-02-19)
   Switched from session cookies to JWT. Expiry: 24h. Refresh: 7d.
+  3 files changed, 142 insertions(+)
 ```
 
 ---
 
-## Why
+## The problem you already have
 
-Claude Code agents forget everything when a session ends. Manual memory tools have three failure points: the agent must decide what to save, remember to save it, and remember to load it at the next start. Most sessions end without any memory saved.
+You spend 90 minutes with Claude Code. You nail the architecture, make key decisions, figure out why the database connection pool needs a 30s timeout. Session ends.
 
-`mem` uses Claude Code hooks that fire **reliably at session boundaries**. The infrastructure captures memory. The agent never has to think about it.
+Next day, you open a new session. **Claude remembers nothing.** You spend the first 20 minutes re-explaining context — what the project does, what you decided yesterday, what you already tried. Then you hit context limit. Compaction wipes the rest.
+
+This is not a small annoyance. It is death by a thousand re-explanations.
+
+### Why existing tools don't fix it
+
+Every memory tool for Claude Code has the same fatal flaw: **the agent has to do it.**
+
+The agent must decide what's worth saving. Remember to call `mem_save`. Load memory at the next session start. Under load, at the end of a long session, after context compaction — agents don't. Humans don't either.
+
+> **Most sessions end without any memory saved. That's not a bug in your workflow. It's the design.**
+
+`mem` removes the agent from the equation entirely. Claude Code's own hooks fire at session boundaries — reliably, automatically, whether the agent cooperates or not. The infrastructure captures memory. You never lose context again.
+
+```
+$ mem stats
+Memories: 47 active, 3 cold
+Projects: 6
+Sessions: 31 captured
+Last: your-api — 2026-02-20 (3 files, 89 insertions)
+```
+
+### What you get back
+
+- **Session continuity** — every new session opens with the last 3 sessions already in context
+- **Compaction survival** — PreCompact hook injects recent memories *before* the window is truncated
+- **Zero overhead** — no `mem_save` calls, no per-project setup, no agent discipline required
+- **Full-text search** — FTS5 + porter stemming across everything ever captured
+- **Memory decay** — Ebbinghaus-style scoring automatically archives stale memories; accessed ones stay sharp
+- **Cross-project memory** — promote a pattern to global scope; it appears in every project's context
+- **CLAUDE.md suggestions** — `mem suggest-rules` analyses your sessions and outputs rules ready to paste
 
 ## Install
 
@@ -84,25 +112,29 @@ chmod +x ~/.claude/hooks/mem-*.sh
 
 ## How it works
 
+Three hooks. Zero agent involvement.
+
 ```
 Claude Code session
   │
-  ├─ SessionStart hook
-  │     → writes .mem-context.md to project root (last 3 sessions)
-  │     → @-include in CLAUDE.md for auto-injection into every session
+  ├─ SessionStart hook  ← fires before Claude sees anything
+  │     → reads last 3 session summaries from ~/.mem/mem.db
+  │     → writes .mem-context.md to project root
+  │     → @-included in CLAUDE.md → Claude opens with full context
   │
-  ├─ [session runs — agent can also call MCP tools explicitly]
+  ├─ [session runs — agent works normally]
+  │     → agent can also call MCP tools explicitly (mem_search, mem_save…)
   │
-  ├─ PreCompact hook
-  │     → outputs {"additionalContext": "..."} JSON to stdout
-  │     → Claude Code injects this into post-compaction context
-  │     → recent memories survive the context window limit
+  ├─ PreCompact hook  ← fires before context window is truncated
+  │     → injects recent memories as {"additionalContext": "..."}
+  │     → Claude Code merges this into post-compaction context
+  │     → nothing is lost when the window fills up
   │
-  └─ Stop hook
-        → reads hook stdin JSON (cwd, session_id)
-        → runs git diff --stat HEAD
-        → writes structured summary to ~/.mem/mem.db
-        → no agent involvement
+  └─ Stop hook  ← fires when session ends, with or without agent cooperation
+        → parses hook stdin: cwd, session_id, transcript_path
+        → captures git log (committed work) + git diff --stat
+        → writes structured memory to ~/.mem/mem.db
+        → no agent call required, no agent discipline required
 ```
 
 Storage: `~/.mem/mem.db` — single SQLite file, WAL mode, FTS5 full-text search with porter stemming.
@@ -239,11 +271,14 @@ hooks/
 
 | | Manual memory tools | **mem** |
 |--|---------------------|---------|
-| Capture trigger | Agent must call | **Hook (automatic)** |
-| Survives compaction | No | **Yes (PreCompact hook)** |
-| Context on start | Agent must call | **Automatic (SessionStart)** |
-| System deps | Varies | **None (bundled SQLite)** |
-| Search | Varies | **FTS5 + porter stemmer** |
+| Capture trigger | Agent must call | **Hook — fires automatically** |
+| Survives compaction | No | **Yes — PreCompact hook injects context** |
+| Context on start | Agent must call | **Automatic — SessionStart writes it** |
+| System deps | Varies | **None — bundled SQLite binary** |
+| Memory freshness | Never expires | **Ebbinghaus decay — accessed memories stay, stale ones archive** |
+| Cross-project memory | No | **Yes — promote any memory to global scope** |
+| Pattern extraction | Manual | **`suggest-rules` analyses sessions → CLAUDE.md rules** |
+| Search | Varies | **FTS5 + porter stemmer, full history** |
 | MCP tools | Varies | **9 built-in tools** |
 
 ## Contributing
