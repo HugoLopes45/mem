@@ -5,8 +5,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::types::{
-    DbStats, GainStats, Memory, MemoryScope, MemoryStatus, MemoryType, ProjectGainRow,
-    TranscriptAnalytics,
+    DbStats, GainStats, IndexedFile, Memory, MemoryScope, MemoryStatus, MemoryType, ProjectGainRow,
+    SearchResult, TranscriptAnalytics, UpsertOutcome,
 };
 
 const SCHEMA: &str = include_str!("../migrations/001_init.sql");
@@ -456,6 +456,134 @@ impl Db {
         let rows = stmt.query_map(params![limit_i64], row_to_memory)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
+
+    // ── Indexed files ─────────────────────────────────────────────────────────
+
+    pub fn upsert_indexed_file(
+        &self,
+        source_path: &str,
+        project_path: Option<&str>,
+        project_name: &str,
+        title: &str,
+        content: &str,
+        mtime: i64,
+    ) -> Result<UpsertOutcome> {
+        let existing = self.conn.query_row(
+            "SELECT id, file_mtime_secs FROM indexed_files WHERE source_path = ?1",
+            params![source_path],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        );
+
+        match existing {
+            Ok((_id, existing_mtime)) if existing_mtime == mtime => {
+                return Ok(UpsertOutcome::Unchanged);
+            }
+            Ok(_) => {
+                // mtime changed — fall through to upsert
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // New row — fall through to upsert
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let is_new = matches!(existing, Err(rusqlite::Error::QueryReturnedNoRows));
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO indexed_files
+                 (id, source_path, project_path, project_name, title, content, indexed_at, file_mtime_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, source_path, project_path, project_name, title, content, now, mtime],
+        )?;
+
+        if is_new {
+            Ok(UpsertOutcome::New)
+        } else {
+            Ok(UpsertOutcome::Updated)
+        }
+    }
+
+    pub fn search_indexed_files(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IndexedFile>> {
+        let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        if let Some(proj) = project {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.id, f.source_path, f.project_path, f.project_name, f.title,
+                        f.content, f.indexed_at, f.file_mtime_secs
+                 FROM indexed_files f
+                 JOIN indexed_files_fts fts ON f.rowid = fts.rowid
+                 WHERE indexed_files_fts MATCH ?1
+                   AND (f.project_path = ?2 OR f.project_name = ?2)
+                 ORDER BY rank
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![safe_query, proj, limit_i64], row_to_indexed_file)?;
+            rows.map(|r| r.map_err(Into::into)).collect()
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.id, f.source_path, f.project_path, f.project_name, f.title,
+                        f.content, f.indexed_at, f.file_mtime_secs
+                 FROM indexed_files f
+                 JOIN indexed_files_fts fts ON f.rowid = fts.rowid
+                 WHERE indexed_files_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![safe_query, limit_i64], row_to_indexed_file)?;
+            rows.map(|r| r.map_err(Into::into)).collect()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn list_indexed_files(&self) -> Result<Vec<IndexedFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_path, project_path, project_name, title, content, indexed_at, file_mtime_secs
+             FROM indexed_files
+             ORDER BY project_name ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_indexed_file)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    pub fn search_unified(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        // Query each source for up to `limit` so neither is starved when the other
+        // returns few matches. The interleave + truncate caps the combined total.
+        let memories = self.search_memories(query, project, limit)?;
+        let files = self.search_indexed_files(query, project, limit)?;
+
+        let mut results: Vec<SearchResult> = Vec::with_capacity(limit);
+        let mut mi = memories.into_iter();
+        let mut fi = files.into_iter();
+        loop {
+            match (mi.next(), fi.next()) {
+                (None, None) => break,
+                (Some(m), None) => results.push(SearchResult::Memory(m)),
+                (None, Some(f)) => results.push(SearchResult::IndexedFile(f)),
+                (Some(m), Some(f)) => {
+                    results.push(SearchResult::Memory(m));
+                    results.push(SearchResult::IndexedFile(f));
+                }
+            }
+            if results.len() >= limit {
+                break;
+            }
+        }
+        results.truncate(limit);
+        Ok(results)
+    }
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
@@ -513,6 +641,25 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
                 rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
             })?
         },
+    })
+}
+
+fn row_to_indexed_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFile> {
+    let indexed_at_str: String = row.get("indexed_at")?;
+    let indexed_at = indexed_at_str
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    Ok(IndexedFile {
+        id: row.get("id")?,
+        source_path: row.get("source_path")?,
+        project_path: row.get("project_path")?,
+        project_name: row.get("project_name")?,
+        title: row.get("title")?,
+        content: row.get("content")?,
+        indexed_at,
+        file_mtime_secs: row.get("file_mtime_secs")?,
     })
 }
 
@@ -1311,7 +1458,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1, "user_version should remain 1 on reopen");
+        assert_eq!(version, 1, "user_version should be 1 on reopen");
     }
 
     // ── Cold global memory excluded from scoped search ───────────────────────
@@ -1367,6 +1514,7 @@ mod tests {
             output_tokens: 500,
             cache_read_tokens: 200,
             cache_creation_tokens: 50,
+            last_assistant_message: None,
         };
         db.update_session_analytics("sess-analytics", &analytics)
             .unwrap();
@@ -1397,6 +1545,7 @@ mod tests {
                     output_tokens: 50,
                     cache_read_tokens: 30,
                     cache_creation_tokens: 10,
+                    last_assistant_message: None,
                 },
             )
             .unwrap();
@@ -1430,11 +1579,294 @@ mod tests {
                 output_tokens: 50,
                 cache_read_tokens: 20,
                 cache_creation_tokens: 5,
+                last_assistant_message: None,
             },
         );
         assert!(result.is_ok(), "missing session_id must not return Err");
         // No sessions exist, so gain_stats shows 0
         let g = db.gain_stats().unwrap();
         assert_eq!(g.session_count, 0);
+    }
+
+    // ── indexed_files tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_indexed_file_new() {
+        let db = in_memory_db();
+        let outcome = db
+            .upsert_indexed_file(
+                "/home/user/.claude/projects/foo/memory/MEMORY.md",
+                Some("/home/user/projects/foo"),
+                "foo",
+                "Foo MEMORY",
+                "some content",
+                1000,
+            )
+            .unwrap();
+        assert_eq!(outcome, UpsertOutcome::New);
+    }
+
+    #[test]
+    fn upsert_indexed_file_unchanged() {
+        let db = in_memory_db();
+        db.upsert_indexed_file("/path/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        let outcome = db
+            .upsert_indexed_file("/path/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        assert_eq!(outcome, UpsertOutcome::Unchanged);
+    }
+
+    #[test]
+    fn upsert_indexed_file_updated() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "proj",
+            "Title",
+            "old content",
+            1000,
+        )
+        .unwrap();
+        let outcome = db
+            .upsert_indexed_file(
+                "/path/MEMORY.md",
+                None,
+                "proj",
+                "Title",
+                "new content",
+                2000,
+            )
+            .unwrap();
+        assert_eq!(outcome, UpsertOutcome::Updated);
+    }
+
+    #[test]
+    fn search_indexed_files_finds_content() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "polybot-ts",
+            "Polybot Memory",
+            "Biome forbids non-null assertion",
+            1000,
+        )
+        .unwrap();
+        let results = db.search_indexed_files("biome", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_name, "polybot-ts");
+    }
+
+    #[test]
+    fn search_indexed_files_injection_safety() {
+        let db = in_memory_db();
+        db.upsert_indexed_file("/path/MEMORY.md", None, "proj", "Title", "content", 1000)
+            .unwrap();
+        for bad in &["AND OR", "\"unterminated", "NEAR(a b)"] {
+            let res = db.search_indexed_files(bad, None, 10);
+            assert!(res.is_ok(), "query {bad:?} should not error");
+        }
+    }
+
+    #[test]
+    fn search_indexed_files_project_filter() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/a/MEMORY.md",
+            Some("/proj-a"),
+            "proj-a",
+            "A Patterns",
+            "rust async tokio",
+            1000,
+        )
+        .unwrap();
+        db.upsert_indexed_file(
+            "/b/MEMORY.md",
+            Some("/proj-b"),
+            "proj-b",
+            "B Patterns",
+            "rust async tokio",
+            1000,
+        )
+        .unwrap();
+
+        // With project filter — only proj-a
+        let results = db
+            .search_indexed_files("tokio", Some("/proj-a"), 10)
+            .unwrap();
+        assert_eq!(results.len(), 1, "project filter should limit to proj-a");
+        assert_eq!(results[0].project_name, "proj-a");
+
+        // Without project filter — both
+        let all = db.search_indexed_files("tokio", None, 10).unwrap();
+        assert_eq!(all.len(), 2, "no filter should return both projects");
+    }
+
+    #[test]
+    fn search_indexed_files_update_refreshes_fts_index() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "proj",
+            "Title",
+            "old unique term xyzzy",
+            1000,
+        )
+        .unwrap();
+        // Update with new content
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "proj",
+            "Title",
+            "new unique term frobble",
+            2000,
+        )
+        .unwrap();
+
+        // Old term should no longer match
+        let old = db.search_indexed_files("xyzzy", None, 10).unwrap();
+        assert!(
+            old.is_empty(),
+            "old term should be removed from FTS after update"
+        );
+
+        // New term should match
+        let new = db.search_indexed_files("frobble", None, 10).unwrap();
+        assert_eq!(new.len(), 1, "new term should be searchable after update");
+    }
+
+    #[test]
+    fn search_unified_returns_both_sources() {
+        let db = in_memory_db();
+        db.save_memory(
+            "rust async",
+            MemoryType::Manual,
+            "tokio runtime content",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "myproj",
+            "Rust Patterns",
+            "tokio async runtime patterns",
+            1000,
+        )
+        .unwrap();
+        let results = db.search_unified("tokio", None, 10).unwrap();
+        let has_memory = results.iter().any(|r| matches!(r, SearchResult::Memory(_)));
+        let has_file = results
+            .iter()
+            .any(|r| matches!(r, SearchResult::IndexedFile(_)));
+        assert!(has_memory, "unified search should include memories");
+        assert!(has_file, "unified search should include indexed files");
+    }
+
+    #[test]
+    fn search_unified_only_memories_match() {
+        let db = in_memory_db();
+        db.save_memory(
+            "jwt auth",
+            MemoryType::Manual,
+            "jwt token content unique",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // No indexed files — unified search should still return memories up to limit
+        let results = db.search_unified("jwt", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SearchResult::Memory(_)));
+    }
+
+    #[test]
+    fn search_unified_only_files_match() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/path/MEMORY.md",
+            None,
+            "proj",
+            "Title",
+            "biome linter unique term",
+            1000,
+        )
+        .unwrap();
+        // No memories — unified search should still return indexed files up to limit
+        let results = db.search_unified("biome", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], SearchResult::IndexedFile(_)));
+    }
+
+    #[test]
+    fn search_unified_respects_limit() {
+        let db = in_memory_db();
+        for i in 0..5 {
+            db.save_memory(
+                &format!("rust memory {i}"),
+                MemoryType::Manual,
+                "rust async tokio content",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            db.upsert_indexed_file(
+                &format!("/path/{i}/MEMORY.md"),
+                None,
+                &format!("proj{i}"),
+                "Rust Patterns",
+                "rust async tokio patterns",
+                1000 + i as i64,
+            )
+            .unwrap();
+        }
+        let results = db.search_unified("tokio", None, 3).unwrap();
+        assert_eq!(results.len(), 3, "unified search must respect limit");
+    }
+
+    #[test]
+    fn list_indexed_files_returns_ordered_by_project() {
+        let db = in_memory_db();
+        db.upsert_indexed_file(
+            "/z/MEMORY.md",
+            None,
+            "zoo",
+            "Zoo Memory",
+            "zoo content",
+            1000,
+        )
+        .unwrap();
+        db.upsert_indexed_file(
+            "/a/MEMORY.md",
+            None,
+            "apple",
+            "Apple Memory",
+            "apple content",
+            1000,
+        )
+        .unwrap();
+        db.upsert_indexed_file(
+            "/m/MEMORY.md",
+            None,
+            "mango",
+            "Mango Memory",
+            "mango content",
+            1000,
+        )
+        .unwrap();
+
+        let files = db.list_indexed_files().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].project_name, "apple");
+        assert_eq!(files[1].project_name, "mango");
+        assert_eq!(files[2].project_name, "zoo");
     }
 }

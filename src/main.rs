@@ -9,9 +9,9 @@ use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
-use auto::{format_context_markdown, AutoCapture};
+use auto::{format_context_markdown, read_mtime_secs, scan_and_index_memory_files, AutoCapture};
 use db::Db;
-use types::{CompactContextOutput, MemoryType};
+use types::{CompactContextOutput, MemoryType, SearchResult};
 
 fn default_db_path() -> PathBuf {
     match dirs::home_dir() {
@@ -143,6 +143,17 @@ enum Commands {
         /// Memory ID to delete
         id: String,
     },
+
+    /// Index all MEMORY.md files from ~/.claude/projects/ for cross-project search
+    Index {
+        /// Index a single file instead of scanning all projects
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Show what would be indexed without writing to DB
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -177,6 +188,7 @@ fn main() -> Result<()> {
         Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
         Commands::Gain => cmd_gain(db_path),
         Commands::Delete { id } => cmd_delete(db_path, id),
+        Commands::Index { path, dry_run } => cmd_index(db_path, path, dry_run),
     }
 }
 
@@ -285,22 +297,34 @@ fn cmd_search(
     limit: usize,
 ) -> Result<()> {
     let db = Db::open(&db_path)?;
-    let results = db.search_memories(&query, project.as_deref(), limit)?;
+    let results = db.search_unified(&query, project.as_deref(), limit)?;
 
     if results.is_empty() {
         println!("No memories found for: {query}");
         return Ok(());
     }
 
-    for m in &results {
-        println!(
-            "[{}] {} ({}) [{}]\n  {}\n",
-            m.memory_type,
-            m.title,
-            m.created_at.format("%Y-%m-%d"),
-            m.scope,
-            m.content.lines().next().unwrap_or(""),
-        );
+    for r in &results {
+        match r {
+            SearchResult::Memory(m) => {
+                println!(
+                    "[{}] {} ({}) [{}]\n  {}\n",
+                    m.memory_type,
+                    m.title,
+                    m.created_at.format("%Y-%m-%d"),
+                    m.scope,
+                    m.content.lines().next().unwrap_or(""),
+                );
+            }
+            SearchResult::IndexedFile(f) => {
+                println!(
+                    "[MEMORY.md: {}] {}\n  {}\n",
+                    f.project_name,
+                    f.title,
+                    f.content.lines().next().unwrap_or(""),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -382,6 +406,99 @@ fn cmd_delete(db_path: PathBuf, id: String) -> Result<()> {
     } else {
         anyhow::bail!("No memory found with id: {id}")
     }
+}
+
+fn cmd_index(db_path: PathBuf, path: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    if let Some(p) = path {
+        return cmd_index_single(db_path, p, dry_run);
+    }
+
+    let db = Db::open(&db_path)?;
+    let stats = scan_and_index_memory_files(&db, dry_run)?;
+
+    if stats.entries.is_empty() {
+        println!("No MEMORY.md files found under ~/.claude/projects/");
+        return Ok(());
+    }
+
+    let label = if dry_run { " [dry-run]" } else { "" };
+    println!("Indexed MEMORY.md files{label}:");
+    for entry in &stats.entries {
+        let indicator = match entry.status {
+            types::IndexEntryStatus::New => "+",
+            types::IndexEntryStatus::Updated => "~",
+            types::IndexEntryStatus::Unchanged => "=",
+            types::IndexEntryStatus::Skipped => "-",
+        };
+        println!(
+            "  {indicator} {} ({} lines)",
+            entry.project_name, entry.line_count
+        );
+    }
+
+    println!();
+    if dry_run {
+        println!(
+            "{} new, {} updated, {} unchanged, {} skipped [dry-run]",
+            stats.new, stats.updated, stats.unchanged, stats.skipped
+        );
+    } else {
+        println!(
+            "{} new, {} updated, {} unchanged, {} skipped",
+            stats.new, stats.updated, stats.unchanged, stats.skipped
+        );
+    }
+    Ok(())
+}
+
+fn cmd_index_single(db_path: PathBuf, path: PathBuf, dry_run: bool) -> Result<()> {
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+
+    let line_count = content.lines().count();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("MEMORY.md");
+    let title = auto::extract_title(&content, filename);
+
+    // Navigate up two levels: MEMORY.md → memory/ → project dir
+    let project_name = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "[mem] warn: cannot determine project name from path {}, using 'unknown'",
+                path.display()
+            );
+            "unknown"
+        })
+        .to_string();
+
+    let mtime = read_mtime_secs(&path);
+
+    if dry_run {
+        println!(
+            "[dry-run] would index: {} ({line_count} lines, title: {title:?})",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let db = Db::open(&db_path)?;
+    let source_path = path.to_string_lossy().to_string();
+    let outcome =
+        db.upsert_indexed_file(&source_path, None, &project_name, &title, &content, mtime)?;
+
+    let label = match outcome {
+        types::UpsertOutcome::New => "+ new",
+        types::UpsertOutcome::Updated => "~ updated",
+        types::UpsertOutcome::Unchanged => "= unchanged",
+    };
+    println!("{label}: {} ({line_count} lines)", path.display());
+    Ok(())
 }
 
 fn cmd_suggest_rules(db_path: PathBuf, limit: usize) -> Result<()> {

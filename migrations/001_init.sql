@@ -1,7 +1,6 @@
 -- mem: persistent memory for Claude Code sessions
 -- Storage: SQLite WAL + FTS5
 -- This is the canonical schema. Applied once on a fresh database (user_version 0 → 1).
--- All prior incremental migrations (002–005) have been squashed into this file.
 
 -- Session tracking (created first; memories.session_id references this table)
 CREATE TABLE IF NOT EXISTS sessions (
@@ -77,3 +76,40 @@ CREATE INDEX IF NOT EXISTS memories_type_created_idx   ON memories(type, created
 
 -- OR scope='global' join in search/context queries
 CREATE INDEX IF NOT EXISTS memories_scope_idx          ON memories(scope);
+
+-- Indexed MEMORY.md files for cross-project search
+CREATE TABLE IF NOT EXISTS indexed_files (
+    id              TEXT PRIMARY KEY,
+    source_path     TEXT NOT NULL UNIQUE,
+    project_path    TEXT,                   -- real path decoded from dir name (nullable)
+    project_name    TEXT NOT NULL,          -- last path component, e.g. "polybot-ts"
+    title           TEXT NOT NULL,          -- from # H1 header, or "MEMORY"
+    content         TEXT NOT NULL,
+    indexed_at      TEXT NOT NULL,
+    file_mtime_secs INTEGER NOT NULL        -- Unix seconds, for O(1) change detection
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS indexed_files_fts USING fts5(
+    title, content,
+    content='indexed_files', content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS indexed_files_ai AFTER INSERT ON indexed_files BEGIN
+    INSERT INTO indexed_files_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS indexed_files_ad AFTER DELETE ON indexed_files BEGIN
+    INSERT INTO indexed_files_fts(indexed_files_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS indexed_files_au AFTER UPDATE ON indexed_files BEGIN
+    INSERT INTO indexed_files_fts(indexed_files_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+    INSERT INTO indexed_files_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
+END;
+
+CREATE INDEX IF NOT EXISTS indexed_files_project_name_idx ON indexed_files(project_name);

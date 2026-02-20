@@ -5,6 +5,28 @@ All notable changes to `mem` will be documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `mem index` — scan all `~/.claude/projects/*/memory/MEMORY.md` files and index them into a new `indexed_files` FTS5 table. Supports `--dry-run` (preview with accurate new/updated/unchanged status) and `--path <file>` (single-file mode).
+- `mem search` now queries both auto-captured memories **and** indexed MEMORY.md files in a single unified result set, interleaved by relevance. Results are labelled `[MEMORY.md: <project>]` to distinguish source.
+- `--project` filter on `mem search` now applies to both memories and indexed files (previously only filtered memories).
+- `MEM_CLAUDE_DIR` env var — override the Claude Code projects root used by `mem index` (default: `~/.claude/projects/`). Useful for CI and tests.
+- Migration `002_indexed_files.sql` — `indexed_files` table with FTS5 virtual table, three sync triggers (insert/delete/update), and a `project_name` index. Applied via table-existence check rather than `user_version` to handle databases created before the schema squash.
+- `read_mtime_secs()` helper in `auto.rs` — replaces the silent `.ok().and_then()` mtime chain; now logs a warning at each failure point (stat, modified(), epoch conversion) so the `Unchanged` optimisation is never silently broken.
+- `IndexStats::record()` — enforces counter/entries consistency at every mutation site; `skipped` entries are counted but excluded from the display list.
+- 12 new tests (118 → 130 total): project filter on indexed-file search, FTS trigger correctness after update, `search_unified` edge cases (only memories, only files, limit enforcement), `list_indexed_files` ordering, scan Unchanged/Updated paths, `decode_project_path` edge cases (empty entries, malformed JSON), `extract_title` negative cases (H2, no space after `#`).
+
+### Changed
+- `search_indexed_files` signature gains a `project: Option<&str>` parameter for `--project` scoping.
+- `search_unified` now queries each source for up to `limit` results (was `limit/2`) so neither source is starved when the other returns few matches.
+- `decode_project_path` now logs a warning (`[mem] warn: malformed sessions-index.json`) when the JSON file exists but fails to parse, before falling back to the naive hyphen-decode strategy.
+- Non-UTF-8 project directory names are now logged and skipped (previously stored an empty string as `project_name`).
+- `DirEntry` iteration errors in `scan_and_index_memory_files_in` now increment `stats.skipped` and emit a warning (previously silently continued).
+- `file_mtime` column renamed to `file_mtime_secs` in the DB and `IndexedFile` struct — unit (Unix seconds) is now explicit in both name and doc comment.
+- Migration gate uses `sqlite_master` table-existence check and propagates query errors with `?` instead of `.unwrap_or(0)`.
+- Doc comment for `decode_project_path` Strategy 2 corrected: was "prepend nothing"; now accurately describes "strip leading `-`, replace remaining `-` with `/`, prepend `/`".
+
 ## [0.3.0] — 2026-02-20
 
 ### Added

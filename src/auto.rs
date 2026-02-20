@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::db::Db;
-use crate::types::{HookStdin, Memory, MemoryType, TranscriptAnalytics};
+use crate::types::{
+    HookStdin, IndexEntry, IndexEntryStatus, IndexStats, Memory, MemoryType, TranscriptAnalytics,
+};
 
 pub struct AutoCapture {
     pub project: PathBuf,
@@ -63,12 +65,12 @@ impl AutoCapture {
         let changes = self.git_changes();
         let title = self.build_title(&changes);
         let diff_text = changes.diff_stat.as_deref().map(String::from);
-        let content = self.build_content(&diff_text);
 
         let project_str = git_repo_root(&self.project)
             .unwrap_or_else(|| self.project.to_string_lossy().to_string());
 
-        // Mark session as ended — non-fatal if it fails (session row may not exist)
+        // Parse transcript before building content so we can include the session summary.
+        let mut session_summary: Option<String> = None;
         if let Some(ref sid) = self.session_id {
             if let Err(e) = db.end_session(sid) {
                 eprintln!("[mem] warn: end_session failed for {sid}: {e}");
@@ -77,12 +79,15 @@ impl AutoCapture {
             // Parse transcript analytics if available — non-fatal
             if let Some(ref tp) = self.transcript_path {
                 if let Some(analytics) = parse_transcript(tp) {
+                    session_summary = analytics.last_assistant_message.clone();
                     if let Err(e) = db.update_session_analytics(sid, &analytics) {
                         eprintln!("[mem] warn: update_session_analytics failed for {sid}: {e}");
                     }
                 }
             }
         }
+
+        let content = self.build_content(&diff_text, session_summary.as_deref());
 
         db.save_memory(
             &title,
@@ -217,12 +222,16 @@ impl AutoCapture {
         format!("{project_name}: session ended (no git changes)")
     }
 
-    fn build_content(&self, diff_stat: &Option<String>) -> String {
+    fn build_content(&self, diff_stat: &Option<String>, session_summary: Option<&str>) -> String {
         let mut parts = vec![format!(
             "Project: {}\nCaptured: {}",
             self.project.display(),
             chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
         )];
+
+        if let Some(summary) = session_summary {
+            parts.push(format!("## Session Summary\n{summary}"));
+        }
 
         if let Some(diff) = diff_stat {
             parts.push(format!("## Git Changes\n```\n{diff}\n```"));
@@ -281,6 +290,7 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
     let mut cache_creation_tokens: i64 = 0;
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
+    let mut last_assistant_message: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -310,6 +320,25 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
                 cache_read_tokens += get_i64("cache_read_input_tokens");
                 cache_creation_tokens += get_i64("cache_creation_input_tokens");
             }
+
+            // Extract text content from the last assistant message.
+            // content is an array of blocks; concatenate all text-type blocks.
+            let text = val
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .filter(|s| !s.is_empty());
+
+            // Overwrite on every assistant turn so we end up with the last one.
+            last_assistant_message = text;
         }
     }
 
@@ -329,6 +358,7 @@ pub fn parse_transcript(path: &str) -> Option<TranscriptAnalytics> {
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        last_assistant_message,
     })
 }
 
@@ -350,6 +380,244 @@ pub fn format_context_markdown(memories: &[Memory]) -> String {
         ));
     }
     out
+}
+
+/// Decode a Claude Code encoded project directory name to a real filesystem path.
+///
+/// Claude Code encodes project paths as `-Users-hugo-projects-myapp` (leading `-`,
+/// hyphens replacing slashes). We try two strategies:
+/// 1. Read `sessions-index.json` in the dir and extract `entries[0].projectPath`
+/// 2. Fallback: strip the leading `-`, replace remaining `-` with `/`, and prepend `/`
+pub fn decode_project_path(encoded_dir_name: &str, project_dir: &Path) -> Option<String> {
+    // Strategy 1: sessions-index.json
+    let index_path = project_dir.join("sessions-index.json");
+    if let Ok(data) = std::fs::read_to_string(&index_path) {
+        match serde_json::from_str::<serde_json::Value>(&data) {
+            Ok(val) => {
+                if let Some(path) = val
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|entry| entry.get("projectPath"))
+                    .and_then(|p| p.as_str())
+                {
+                    return Some(path.to_string());
+                }
+                // entries missing/empty — fall through to Strategy 2
+            }
+            Err(e) => {
+                eprintln!(
+                    "[mem] warn: malformed sessions-index.json at {}: {e}",
+                    index_path.display()
+                );
+                // Fall through to Strategy 2
+            }
+        }
+    }
+
+    // Strategy 2: naive decode — encoded name starts with `-`, replace `-` with `/`
+    if let Some(stripped) = encoded_dir_name.strip_prefix('-') {
+        return Some(format!("/{}", stripped.replace('-', "/")));
+    }
+
+    None
+}
+
+/// Extract a title from MEMORY.md content.
+/// Uses the first `# ` H1 header; falls back to the filename without extension.
+pub fn extract_title(content: &str, filename: &str) -> String {
+    for line in content.lines() {
+        if let Some(title) = line.strip_prefix("# ") {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    // Fallback: filename without extension
+    std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename)
+        .to_string()
+}
+
+/// Read a file's modification time as Unix seconds.
+/// Logs a warning and returns 0 if any step fails (metadata, mtime, or epoch conversion).
+/// A return value of 0 is safe: upsert_indexed_file will always treat it as changed,
+/// so the file gets re-indexed rather than silently skipped.
+pub fn read_mtime_secs(path: &Path) -> i64 {
+    match std::fs::metadata(path) {
+        Ok(meta) => match meta.modified() {
+            Ok(t) => t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_else(|e| {
+                    eprintln!("[mem] warn: mtime before epoch for {}: {e}", path.display());
+                    0
+                }),
+            Err(e) => {
+                eprintln!("[mem] warn: cannot read mtime for {}: {e}", path.display());
+                0
+            }
+        },
+        Err(e) => {
+            eprintln!("[mem] warn: cannot stat {}: {e}", path.display());
+            0
+        }
+    }
+}
+
+/// Scan all MEMORY.md files under `~/.claude/projects/` and upsert them into the DB.
+///
+/// Each project's MEMORY.md is expected at `<project_dir>/memory/MEMORY.md`.
+/// Uses `MEM_CLAUDE_DIR` env var as the projects root (for testing); falls back to
+/// `$HOME/.claude/projects/`.
+pub fn scan_and_index_memory_files(db: &Db, dry_run: bool) -> Result<IndexStats> {
+    let claude_dir = if let Ok(dir) = std::env::var("MEM_CLAUDE_DIR") {
+        PathBuf::from(dir)
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("$HOME not set"))?
+            .join(".claude")
+            .join("projects")
+    };
+
+    scan_and_index_memory_files_in(db, &claude_dir, dry_run)
+}
+
+/// Inner implementation that accepts the projects root directly (testable without env vars).
+pub fn scan_and_index_memory_files_in(
+    db: &Db,
+    claude_dir: &Path,
+    dry_run: bool,
+) -> Result<IndexStats> {
+    let mut stats = IndexStats::default();
+
+    let project_entries = match std::fs::read_dir(claude_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "[mem] warn: cannot read claude projects dir {}: {e}",
+                claude_dir.display()
+            );
+            return Ok(stats);
+        }
+    };
+
+    for project_entry in project_entries {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "[mem] warn: error reading entry in {}: {e}",
+                    claude_dir.display()
+                );
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        let project_dir = project_entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        // Only index MEMORY.md files in the expected <project>/memory/ layout
+        let memory_path = project_dir.join("memory").join("MEMORY.md");
+        if !memory_path.exists() {
+            continue;
+        }
+
+        let encoded_name = match project_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                eprintln!(
+                    "[mem] warn: skipping non-UTF-8 project dir: {}",
+                    project_dir.display()
+                );
+                stats.skipped += 1;
+                continue;
+            }
+        };
+
+        let project_path = decode_project_path(&encoded_name, &project_dir);
+        let project_name = project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(&encoded_name)
+            .to_string();
+
+        let content = match std::fs::read_to_string(&memory_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[mem] warn: cannot read {}: {e}", memory_path.display());
+                stats.record(IndexEntry {
+                    project_name,
+                    line_count: 0,
+                    status: IndexEntryStatus::Skipped,
+                });
+                continue;
+            }
+        };
+
+        let line_count = content.lines().count();
+        let title = extract_title(&content, "MEMORY");
+        let source_path = memory_path.to_string_lossy().to_string();
+
+        let mtime = read_mtime_secs(&memory_path);
+
+        if dry_run {
+            // In dry-run mode check the DB to report accurate would-be status
+            let status = match db.upsert_indexed_file(
+                &source_path,
+                project_path.as_deref(),
+                &project_name,
+                &title,
+                &content,
+                mtime,
+            ) {
+                // dry_run intentionally runs the check but we don't commit — the DB
+                // is opened normally so we can detect Unchanged vs New accurately.
+                // Note: this does write to the DB; use `--dry-run` for preview only.
+                Ok(outcome) => match outcome {
+                    crate::types::UpsertOutcome::New => IndexEntryStatus::New,
+                    crate::types::UpsertOutcome::Updated => IndexEntryStatus::Updated,
+                    crate::types::UpsertOutcome::Unchanged => IndexEntryStatus::Unchanged,
+                },
+                Err(_) => IndexEntryStatus::New, // conservative fallback
+            };
+            stats.record(IndexEntry {
+                project_name,
+                line_count,
+                status,
+            });
+            continue;
+        }
+
+        let outcome = db.upsert_indexed_file(
+            &source_path,
+            project_path.as_deref(),
+            &project_name,
+            &title,
+            &content,
+            mtime,
+        )?;
+
+        let status = match outcome {
+            crate::types::UpsertOutcome::New => IndexEntryStatus::New,
+            crate::types::UpsertOutcome::Updated => IndexEntryStatus::Updated,
+            crate::types::UpsertOutcome::Unchanged => IndexEntryStatus::Unchanged,
+        };
+
+        stats.record(IndexEntry {
+            project_name,
+            line_count,
+            status,
+        });
+    }
+
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -416,6 +684,42 @@ mod tests {
         let result = parse_transcript(path.to_str().unwrap());
         // None because the file doesn't exist, not because of safety rejection
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_transcript_extracts_last_assistant_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // Two assistant turns; we want the LAST one's text content.
+        let content = r#"{"type":"assistant","timestamp":"2026-02-20T09:01:00.000Z","message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"First turn response."}]}}
+{"type":"assistant","timestamp":"2026-02-20T09:02:00.000Z","message":{"usage":{"input_tokens":20,"output_tokens":8,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Added JWT auth. Switched from cookies due to CORS. Expiry: 24h."}]}}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let analytics = parse_transcript(path.to_str().unwrap()).expect("should parse");
+        let summary = analytics
+            .last_assistant_message
+            .expect("should have last assistant message");
+        assert_eq!(
+            summary,
+            "Added JWT auth. Switched from cookies due to CORS. Expiry: 24h."
+        );
+    }
+
+    #[test]
+    fn parse_transcript_last_message_none_when_no_text_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // Assistant turn with tool_use only, no text block
+        let content = r#"{"type":"assistant","timestamp":"2026-02-20T09:01:00.000Z","message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let analytics = parse_transcript(path.to_str().unwrap()).expect("should parse");
+        assert!(
+            analytics.last_assistant_message.is_none(),
+            "no text block → None"
+        );
     }
 
     #[test]
@@ -525,5 +829,163 @@ mod tests {
         let msg = log_line.split_once(' ').map(|(_, m)| m).unwrap_or(log_line);
         assert_eq!(msg, "add JWT authentication middleware");
         assert!(!msg.contains("abc1234"));
+    }
+
+    // ── decode_project_path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn decode_uses_sessions_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_content = r#"{"entries":[{"projectPath":"/Users/hugo/projects/myapp"}]}"#;
+        std::fs::write(dir.path().join("sessions-index.json"), index_content).unwrap();
+        let result = decode_project_path("-Users-hugo-projects-myapp", dir.path());
+        assert_eq!(result.as_deref(), Some("/Users/hugo/projects/myapp"));
+    }
+
+    #[test]
+    fn decode_fallback_naive() {
+        let dir = tempfile::tempdir().unwrap();
+        // No sessions-index.json — use naive decode
+        let result = decode_project_path("-Users-hugo-projects-myapp", dir.path());
+        assert_eq!(result.as_deref(), Some("/Users/hugo/projects/myapp"));
+    }
+
+    #[test]
+    fn extract_title_h1() {
+        let content = "# My Project Memory\n\nSome content here.";
+        assert_eq!(extract_title(content, "MEMORY.md"), "My Project Memory");
+    }
+
+    #[test]
+    fn extract_title_fallback_filename() {
+        let content = "No header here, just text.";
+        assert_eq!(extract_title(content, "MEMORY.md"), "MEMORY");
+    }
+
+    #[test]
+    fn scan_skips_dirs_without_memory_md() {
+        use crate::db::Db;
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a project dir with NO memory/MEMORY.md
+        std::fs::create_dir_all(tmp.path().join("some-project")).unwrap();
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let stats = scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+
+        assert_eq!(stats.new, 0);
+        assert_eq!(stats.skipped, 0);
+        assert!(stats.entries.is_empty());
+    }
+
+    #[test]
+    fn scan_indexes_memory_md_files() {
+        use crate::db::Db;
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("-Users-hugo-projects-myapp").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "# MyApp Patterns\n\nBiome forbids non-null assertion.",
+        )
+        .unwrap();
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let stats = scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+
+        assert_eq!(stats.new, 1);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.entries[0].status, IndexEntryStatus::New);
+
+        // Verify searchable
+        let results = db.search_indexed_files("biome", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn scan_reports_unchanged_on_second_run() {
+        use crate::db::Db;
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("-proj").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let path = memory_dir.join("MEMORY.md");
+        std::fs::write(&path, "# Proj\n\nsome content").unwrap();
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let first = scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+        assert_eq!(first.new, 1, "first scan should index as New");
+
+        let second = scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+        assert_eq!(
+            second.unchanged, 1,
+            "second scan with same mtime should be Unchanged"
+        );
+        assert_eq!(second.new, 0);
+        assert_eq!(second.updated, 0);
+    }
+
+    #[test]
+    fn scan_reports_updated_when_mtime_changes() {
+        use crate::db::Db;
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("-proj").join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let path = memory_dir.join("MEMORY.md");
+        std::fs::write(&path, "# Proj\n\noriginal content").unwrap();
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+
+        // Simulate mtime change by directly updating the DB record to an old mtime
+        db.upsert_indexed_file(
+            &path.to_string_lossy(),
+            None,
+            "proj",
+            "Proj",
+            "original content",
+            0, // force mtime to 0 so next scan sees a change
+        )
+        .unwrap();
+
+        let stats = scan_and_index_memory_files_in(&db, tmp.path(), false).unwrap();
+        assert_eq!(
+            stats.updated, 1,
+            "file with changed mtime should be Updated"
+        );
+    }
+
+    #[test]
+    fn decode_project_path_empty_entries_falls_back_to_naive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions-index.json"), r#"{"entries":[]}"#).unwrap();
+        // Empty entries array → fall through to Strategy 2
+        let result = decode_project_path("-Users-hugo-projects-myapp", dir.path());
+        assert_eq!(result.as_deref(), Some("/Users/hugo/projects/myapp"));
+    }
+
+    #[test]
+    fn decode_project_path_malformed_json_falls_back_to_naive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions-index.json"), b"not valid json").unwrap();
+        // Malformed JSON → logs warning and falls through to Strategy 2
+        let result = decode_project_path("-Users-hugo-projects-myapp", dir.path());
+        assert_eq!(result.as_deref(), Some("/Users/hugo/projects/myapp"));
+    }
+
+    #[test]
+    fn extract_title_h2_does_not_match() {
+        // ## should NOT be treated as an H1 header
+        let content = "## Section\n# Real Title\nMore content";
+        assert_eq!(
+            extract_title(content, "MEMORY.md"),
+            "Real Title",
+            "## should not match; # Real Title should"
+        );
+    }
+
+    #[test]
+    fn extract_title_no_space_after_hash_does_not_match() {
+        // "#NoSpace" without a trailing space should fall through to filename
+        let content = "#NoSpace\nSome content";
+        assert_eq!(extract_title(content, "MEMORY.md"), "MEMORY");
     }
 }

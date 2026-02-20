@@ -169,6 +169,8 @@ pub struct TranscriptAnalytics {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// Text content of the last assistant message — used as session summary.
+    pub last_assistant_message: Option<String>,
 }
 
 /// Aggregate statistics across all sessions with analytics data.
@@ -215,6 +217,74 @@ pub struct DbStats {
     pub db_size_bytes: u64,
     pub active_count: u64,
     pub cold_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedFile {
+    pub id: String,
+    pub source_path: String,
+    pub project_path: Option<String>,
+    pub project_name: String,
+    pub title: String,
+    pub content: String,
+    pub indexed_at: DateTime<Utc>,
+    /// Unix timestamp in seconds — matches SQLite INTEGER storage.
+    pub file_mtime_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertOutcome {
+    New,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Debug, Default)]
+pub struct IndexStats {
+    pub new: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    /// Skipped entries are counted but not added to `entries` (no log row for unreadable files).
+    pub skipped: usize,
+    pub entries: Vec<IndexEntry>,
+}
+
+impl IndexStats {
+    /// Record a processed entry, keeping counters and entries in sync.
+    /// Skipped entries increment the counter only — they are not pushed to `entries`.
+    pub fn record(&mut self, entry: IndexEntry) {
+        match entry.status {
+            IndexEntryStatus::New => self.new += 1,
+            IndexEntryStatus::Updated => self.updated += 1,
+            IndexEntryStatus::Unchanged => self.unchanged += 1,
+            IndexEntryStatus::Skipped => {
+                self.skipped += 1;
+                return;
+            }
+        }
+        self.entries.push(entry);
+    }
+}
+
+#[derive(Debug)]
+pub struct IndexEntry {
+    pub project_name: String,
+    pub line_count: usize,
+    pub status: IndexEntryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexEntryStatus {
+    New,
+    Updated,
+    Unchanged,
+    Skipped,
+}
+
+#[derive(Debug)]
+pub enum SearchResult {
+    Memory(Memory),
+    IndexedFile(IndexedFile),
 }
 
 #[cfg(test)]

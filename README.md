@@ -48,7 +48,8 @@ Last: your-api — 2026-02-20 (3 files, 89 insertions)
 - **Session continuity** — every new session opens with the last 3 sessions already in context
 - **Compaction survival** — PreCompact hook injects recent memories *before* the window is truncated
 - **Zero overhead** — no `mem_save` calls, no per-project setup, no agent discipline required
-- **Full-text search** — FTS5 + porter stemming across everything ever captured
+- **Full-text search** — FTS5 + porter stemming across everything ever captured, including MEMORY.md files
+- **Cross-project MEMORY.md index** — `mem index` indexes all `~/.claude/projects/*/memory/MEMORY.md` files; search finds lessons across every project instantly
 - **Memory decay** — Ebbinghaus-style scoring automatically archives stale memories; accessed ones stay sharp
 - **Cross-project memory** — promote a pattern to global scope; it appears in every project's context
 - **CLAUDE.md suggestions** — `mem suggest-rules` analyses your sessions and outputs rules ready to paste
@@ -208,6 +209,14 @@ mem stats
 mem search "database migration"
 mem search "auth" --project /path/to/project --limit 20
 
+# Cross-project MEMORY.md index
+mem index                            # index all ~/.claude/projects/*/memory/MEMORY.md files
+mem index --dry-run                  # preview what would be indexed (new / updated / unchanged)
+mem index --path /path/to/MEMORY.md  # index a single file
+
+# search now queries both auto-captured memories AND indexed MEMORY.md files
+mem search "biome non-null"          # returns results from any project's MEMORY.md
+
 # Manual save
 mem save \
   --title "Chose rusqlite over sqlx" \
@@ -259,21 +268,26 @@ Now every new Claude Code session opens with the last 3 session summaries alread
 |---------|---------|---------|
 | `MEM_DB` | `~/.mem/mem.db` | Custom database path |
 | `MEM_BIN` | `mem` | Custom binary path (for hook scripts) |
+| `MEM_CLAUDE_DIR` | `~/.claude/projects/` | Override Claude Code projects root (used by `mem index`; also useful for tests) |
 
 ## Architecture
 
 ```
 src/
   main.rs        CLI — subcommands: mcp, save, auto, context, search, stats, decay,
-                        promote, demote, suggest-rules, gain, delete
+                        promote, demote, suggest-rules, gain, delete, index
   types.rs       Domain types: Memory, MemoryType, MemoryStatus, MemoryScope,
-                        HookStdin, TranscriptAnalytics, GainStats
-  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic
-  auto.rs        Auto-capture — hook stdin parsing, transcript analytics, git diff
+                        IndexedFile, IndexStats, SearchResult, HookStdin,
+                        TranscriptAnalytics, GainStats
+  db.rs          SQLite layer — rusqlite, FTS5, WAL, all queries, decay logic,
+                        indexed_files upsert/search/list, unified search
+  auto.rs        Auto-capture — hook stdin parsing, transcript analytics, git diff,
+                        MEMORY.md scanning (decode_project_path, scan_and_index_memory_files)
   mcp.rs         MCP server — rmcp 0.16, 10 tools, stdio transport
   suggest.rs     Rule suggestion engine — pure frequency analysis, no LLM
 migrations/
   001_init.sql   Canonical schema: sessions + memories + FTS5 triggers + indexes
+  002_indexed_files.sql  indexed_files table + FTS5 + sync triggers
 hooks/
   mem-stop.sh           Stop hook wrapper
   mem-precompact.sh     PreCompact hook wrapper
@@ -294,6 +308,7 @@ hooks/
 | Cross-project memory | No | **Yes — promote any memory to global scope** |
 | Pattern extraction | Manual | **`suggest-rules` analyses sessions → CLAUDE.md rules** |
 | Search | Varies | **FTS5 + porter stemmer, full history** |
+| Cross-project MEMORY.md | No | **`mem index` + unified search across all projects** |
 | MCP tools | Varies | **10 built-in tools** |
 
 ## Contributing
