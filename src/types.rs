@@ -129,16 +129,6 @@ impl std::str::FromStr for MemoryScope {
     }
 }
 
-#[allow(dead_code)]
-pub struct Session {
-    pub id: String,
-    pub project: Option<String>,
-    pub goal: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: Option<DateTime<Utc>>,
-    pub turn_count: i64,
-}
-
 /// Output from `mem context --compact` — matches Claude Code PreCompact hook protocol.
 // Not serialized beyond this specific use — do not add fields.
 #[derive(Debug, Serialize)]

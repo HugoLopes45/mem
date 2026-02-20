@@ -17,9 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP server — official Rust SDK
+# schemars is kept as a direct dep because JsonSchema derive macros reference
+# ::schemars by name; version is kept in sync with rmcp's transitive dep.
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
 schemars = "1"
-tokio = { version = "1", features = ["full"] }
+# Trim to only the tokio features actually used — consistent with opt-level="z"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 # Storage — sync, simple, fast subprocess startup
 # "bundled" = statically links SQLite (zero system dep)

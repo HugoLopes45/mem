@@ -2,7 +2,6 @@ mod auto;
 mod db;
 mod mcp;
 mod suggest;
-mod tui;
 mod types;
 
 use anyhow::{Context, Result};
@@ -138,9 +137,6 @@ enum Commands {
 
     /// Show session analytics: tokens, cache efficiency, top projects
     Gain,
-
-    /// Interactive search TUI (not yet implemented)
-    Tui,
 }
 
 fn main() -> Result<()> {
@@ -174,10 +170,6 @@ fn main() -> Result<()> {
         Commands::Demote { id } => cmd_demote(db_path, id),
         Commands::SuggestRules { limit } => cmd_suggest_rules(db_path, limit),
         Commands::Gain => cmd_gain(db_path),
-        Commands::Tui => {
-            println!("TUI not yet implemented. Use `mem search <query>` for now.");
-            Ok(())
-        }
     }
 }
 
